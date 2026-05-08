@@ -1,0 +1,165 @@
+#pragma once
+
+/*
+ * Keep tracked defaults as placeholders only.
+ * For local development, copy `src/app_config.local.example.h` to
+ * `src/app_config_local.h`, fill in real values there, and keep that file
+ * ignored by git.
+ */
+#if __has_include("app_config_local.h")
+#include "app_config_local.h"
+#endif
+
+#ifndef APP_WIFI_SSID
+#define APP_WIFI_SSID "CHANGE_ME"
+#endif
+
+#ifndef APP_WIFI_PASSWORD
+#define APP_WIFI_PASSWORD "CHANGE_ME"
+#endif
+
+#ifndef APP_HTTPS_TEST_URL
+#define APP_HTTPS_TEST_URL "https://www.google.com/generate_204"
+#endif
+
+#ifndef APP_AGORA_WHIP_SERVER
+#define APP_AGORA_WHIP_SERVER "ap-webrtc-whip.ap.sd-rtn.com"
+#endif
+
+#ifndef APP_AGORA_APP_ID
+#define APP_AGORA_APP_ID "CHANGE_ME"
+#endif
+
+#ifndef APP_AGORA_APP_CERTIFICATE
+#define APP_AGORA_APP_CERTIFICATE "CHANGE_ME"
+#endif
+
+#ifndef APP_AGORA_STREAM_ID
+#define APP_AGORA_STREAM_ID "CHANGE_ME"
+#endif
+
+#ifndef APP_AGORA_UID
+#define APP_AGORA_UID "10010"
+#endif
+
+#ifndef APP_AGORA_WHIP_TOKEN_TTL_SEC
+#define APP_AGORA_WHIP_TOKEN_TTL_SEC 600
+#endif
+
+#define APP_AUDIO_CODEC_OPUS 3
+#define APP_AUDIO_CODEC_G711A 1
+
+#ifndef APP_AUDIO_CODEC
+#define APP_AUDIO_CODEC APP_AUDIO_CODEC_G711A
+#endif
+
+#ifndef APP_AUDIO_SAMPLE_RATE
+#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
+#define APP_AUDIO_SAMPLE_RATE 8000
+#else
+#define APP_AUDIO_SAMPLE_RATE 48000
+#endif
+#endif
+
+#ifndef APP_AUDIO_CHANNELS
+#define APP_AUDIO_CHANNELS 1
+#endif
+
+#ifndef APP_AUDIO_FRAME_MS
+#define APP_AUDIO_FRAME_MS 20
+#endif
+
+#ifndef APP_WEBRTC_LOOP_DELAY_MS
+#define APP_WEBRTC_LOOP_DELAY_MS 10
+#endif
+
+#ifndef APP_WEBRTC_AGENT_RECV_TIMEOUT_MS
+#define APP_WEBRTC_AGENT_RECV_TIMEOUT_MS 100
+#endif
+
+#ifndef APP_WEBRTC_SEND_POOL_SIZE
+#define APP_WEBRTC_SEND_POOL_SIZE 16384
+#endif
+
+#ifndef APP_WEBRTC_SEND_QUEUE_NUM
+#define APP_WEBRTC_SEND_QUEUE_NUM 64
+#endif
+
+#ifndef APP_AUDIO_USE_I2S_MIC
+#define APP_AUDIO_USE_I2S_MIC 0
+#endif
+
+#ifndef APP_AUDIO_I2S_PORT
+#define APP_AUDIO_I2S_PORT I2S_NUM_0
+#endif
+
+#ifndef APP_AUDIO_I2S_MIC_DATA_GPIO
+#define APP_AUDIO_I2S_MIC_DATA_GPIO GPIO_NUM_46
+#endif
+
+#ifndef APP_AUDIO_I2S_MIC_CLK_GPIO
+#define APP_AUDIO_I2S_MIC_CLK_GPIO GPIO_NUM_43
+#endif
+
+#ifndef APP_AUDIO_I2S_MIC_BCK_GPIO
+#define APP_AUDIO_I2S_MIC_BCK_GPIO GPIO_NUM_NC
+#endif
+
+#ifndef APP_AUDIO_I2S_USE_CARDPUTER_ADV
+#define APP_AUDIO_I2S_USE_CARDPUTER_ADV 0
+#endif
+
+#ifndef APP_AUDIO_I2S_ADV_I2C_PORT
+#define APP_AUDIO_I2S_ADV_I2C_PORT I2C_NUM_0
+#endif
+
+#ifndef APP_AUDIO_I2S_ADV_I2C_SDA_GPIO
+#define APP_AUDIO_I2S_ADV_I2C_SDA_GPIO GPIO_NUM_9
+#endif
+
+#ifndef APP_AUDIO_I2S_ADV_I2C_SCL_GPIO
+#define APP_AUDIO_I2S_ADV_I2C_SCL_GPIO GPIO_NUM_8
+#endif
+
+#define APP_AUDIO_I2S_PDM_FMT_PCM 1
+#define APP_AUDIO_I2S_PDM_FMT_RAW 0
+
+#ifndef APP_AUDIO_I2S_PDM_DATA_FMT
+#define APP_AUDIO_I2S_PDM_DATA_FMT APP_AUDIO_I2S_PDM_FMT_PCM
+#endif
+
+#ifndef APP_AUDIO_I2S_PDM_CLK_INVERT
+#define APP_AUDIO_I2S_PDM_CLK_INVERT 0
+#endif
+
+#ifndef APP_AUDIO_I2S_AUTO_TUNE
+#define APP_AUDIO_I2S_AUTO_TUNE 1
+#endif
+
+#ifndef APP_AUDIO_I2S_ALLOW_RAW_TUNE
+#define APP_AUDIO_I2S_ALLOW_RAW_TUNE 0
+#endif
+
+#ifndef APP_AUDIO_I2S_CAPTURE_RATE
+#define APP_AUDIO_I2S_CAPTURE_RATE 16000
+#endif
+
+#ifndef APP_AUDIO_I2S_ADV_ADC_VOLUME_REG
+#define APP_AUDIO_I2S_ADV_ADC_VOLUME_REG 0xE7
+#endif
+
+#ifndef APP_AUDIO_I2S_ADV_PGA_REG
+#define APP_AUDIO_I2S_ADV_PGA_REG 0x1C
+#endif
+
+#ifndef APP_AUDIO_I2S_GAIN_NUM
+#define APP_AUDIO_I2S_GAIN_NUM 8
+#endif
+
+#ifndef APP_AUDIO_I2S_GAIN_DEN
+#define APP_AUDIO_I2S_GAIN_DEN 1
+#endif
+
+#ifndef APP_AUDIO_I2S_PROFILE_ENABLE
+#define APP_AUDIO_I2S_PROFILE_ENABLE 1
+#endif
