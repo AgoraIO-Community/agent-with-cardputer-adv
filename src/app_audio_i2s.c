@@ -64,26 +64,49 @@ static app_audio_i2s_ctx_t s_audio_i2s;
 static const uint8_t APP_AUDIO_I2S_ADV_ES8311_ADDR = 0x18;
 
 typedef struct {
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+    bool left_slot;
+    bool ws_inv;
+#else
     bool raw_fmt;
+#endif
     bool clk_inv;
     const char *name;
 } app_audio_i2s_mode_t;
 
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+static const app_audio_i2s_mode_t s_audio_i2s_modes[] = {
+    { false, false, false, "right ws_inv=0 bclk_inv=0" },
+    { true,  false, false, "left ws_inv=0 bclk_inv=0" },
+    { false, true,  false, "right ws_inv=0 bclk_inv=1" },
+    { true,  true,  false, "left ws_inv=0 bclk_inv=1" },
+    { false, false, true,  "right ws_inv=1 bclk_inv=0" },
+    { true,  false, true,  "left ws_inv=1 bclk_inv=0" },
+    { false, true,  true,  "right ws_inv=1 bclk_inv=1" },
+    { true,  true,  true,  "left ws_inv=1 bclk_inv=1" },
+};
+#else
 static const app_audio_i2s_mode_t s_audio_i2s_modes[] = {
     { false, false, "pcm clk_inv=0" },
     { true,  false, "raw clk_inv=0" },
     { false, true,  "pcm clk_inv=1" },
     { true,  true,  "raw clk_inv=1" },
 };
+#endif
 
 static bool app_audio_i2s_mode_is_allowed(uint8_t mode_index)
 {
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+    (void)mode_index;
+    return true;
+#else
     const app_audio_i2s_mode_t *mode = &s_audio_i2s_modes[mode_index % (sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]))];
 
     if (!APP_AUDIO_I2S_ALLOW_RAW_TUNE && mode->raw_fmt) {
         return false;
     }
     return true;
+#endif
 }
 
 static uint8_t app_audio_i2s_find_next_allowed_mode(uint8_t current_mode_index)
@@ -101,6 +124,9 @@ static uint8_t app_audio_i2s_find_next_allowed_mode(uint8_t current_mode_index)
 
 static uint8_t app_audio_i2s_initial_mode_index(void)
 {
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+    return 0;
+#else
     for (uint8_t i = 0; i < sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]); i++) {
         if (s_audio_i2s_modes[i].raw_fmt == (APP_AUDIO_I2S_PDM_DATA_FMT == APP_AUDIO_I2S_PDM_FMT_RAW) &&
             s_audio_i2s_modes[i].clk_inv == (APP_AUDIO_I2S_PDM_CLK_INVERT != 0)) {
@@ -108,6 +134,7 @@ static uint8_t app_audio_i2s_initial_mode_index(void)
         }
     }
     return 0;
+#endif
 }
 
 static esp_err_t app_audio_i2s_adv_codec_write_bulk(const uint8_t *bulk_data)
@@ -334,7 +361,7 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
         std_rx_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
         std_rx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
         std_rx_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_MONO;
-        std_rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;
+        std_rx_cfg.slot_cfg.slot_mask = mode->left_slot ? I2S_STD_SLOT_LEFT : I2S_STD_SLOT_RIGHT;
         std_rx_cfg.slot_cfg.ws_width = 16;
         std_rx_cfg.slot_cfg.bit_shift = true;
         std_rx_cfg.slot_cfg.left_align = true;
@@ -346,6 +373,7 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
         std_rx_cfg.gpio_cfg.din = APP_AUDIO_I2S_MIC_DATA_GPIO;
         std_rx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
         std_rx_cfg.gpio_cfg.invert_flags.bclk_inv = mode->clk_inv;
+        std_rx_cfg.gpio_cfg.invert_flags.ws_inv = mode->ws_inv;
 
         err = i2s_channel_init_std_mode(s_audio_i2s.rx_handle, &std_rx_cfg);
         if (err != ESP_OK) {
@@ -353,10 +381,13 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
             return err;
         }
         ESP_RETURN_ON_ERROR(i2s_channel_enable(s_audio_i2s.rx_handle), TAG, "Failed to enable ADV I2S RX channel");
-        ESP_LOGI(TAG, "Initialized Cardputer ADV mic I2S RX on bck=%d ws=%d data=%d capture_rate=%d send_rate=%d clk_inv=%d (%s)",
+        ESP_LOGI(TAG, "Initialized Cardputer ADV mic I2S RX on bck=%d ws=%d data=%d capture_rate=%d send_rate=%d slot=%s ws_inv=%d bclk_inv=%d (%s)",
                  APP_AUDIO_I2S_MIC_BCK_GPIO, APP_AUDIO_I2S_MIC_CLK_GPIO, APP_AUDIO_I2S_MIC_DATA_GPIO,
                  APP_AUDIO_I2S_CAPTURE_RATE, APP_AUDIO_SAMPLE_RATE,
-                 mode->clk_inv ? 1 : 0, mode->name);
+                 mode->left_slot ? "left" : "right",
+                 mode->ws_inv ? 1 : 0,
+                 mode->clk_inv ? 1 : 0,
+                 mode->name);
     }
 #else
     {

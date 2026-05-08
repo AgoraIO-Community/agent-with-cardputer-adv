@@ -1,6 +1,6 @@
 # Cardputer Agora WHIP Publisher
 
-ESP32-S3 / M5Stack Cardputer audio-only WebRTC publisher using WHIP.
+ESP32-S3 / M5Stack Cardputer audio-only WebRTC publisher using WHIP on the current `esp_peer` stack.
 
 ## Current Stage
 
@@ -14,7 +14,7 @@ ESP32-S3 / M5Stack Cardputer audio-only WebRTC publisher using WHIP.
 - [x] M7: fake audio publisher sends frames over the WebRTC path
 - [x] M8: real Cardputer microphone integration on the stable G.711A path
 
-Hardware-verified status on May 8, 2026:
+Hardware-verified status on May 9, 2026:
 - WHIP `201` response succeeds
 - ICE connects
 - DTLS/SRTP handshake completes
@@ -73,6 +73,7 @@ For local development:
 6. Completes ICE, DTLS, and SRTP setup
 7. Sends fake audio frames by default, or can start the real Cardputer ADV I2S mic path when `APP_AUDIO_USE_I2S_MIC` is enabled
 8. Uses G.711A as the stable codec baseline for live mic publishing
+9. Auto-tunes Cardputer ADV mic framing across the known slot / inversion variants if the first capture mode looks constant-valued
 
 ## Expected Serial Milestones
 
@@ -88,16 +89,22 @@ On a working run, the monitor should show lines like:
 
 For the real mic path, you should instead see lines like:
 
-- `Initialized Cardputer ADV mic I2S RX on bck=41 ws=43 data=46 ...`
+- `Initialized Cardputer ADV mic I2S RX on bck=41 ws=43 data=46 ... slot=... ws_inv=... bclk_inv=...`
 - `Cardputer mic audio publisher started`
 - `Mic audio frames sent: 250 ...`
 - `Mic profile: frames=250 avg_us=... max_us=... deadline_miss=0 send_fail=0 ...`
+
+If the initial ADV framing is wrong, you may also see lines like:
+
+- `Auto-tuning Cardputer mic mode: switching from ... to ...`
+- `Cardputer mic mode appears non-constant, keeping ...`
 
 ## Known Limitations
 
 - The display is not used yet.
 - Local Wi-Fi and Agora values must be supplied through `src/app_config_local.h`.
 - The stable live-mic path currently uses `APP_AUDIO_CODEC_G711A`.
+- The current firmware is a WHIP publish-only baseline. Agora WHIP `/push` on this stack is not treated as a remote-audio playback path.
 - Experimental Opus send attempts are not usable on the current prebuilt `esp_peer` implementation:
   - Agora WHIP only accepts the Opus offer as `opus/48000/2`
   - the send path then faults inside the prebuilt peer-default RTP audio packetization code
