@@ -5,18 +5,13 @@
 #include <string.h>
 
 #include "app_audio_adv_codec.h"
-#include "app_audio_i2s.h"
 #include "app_codec_g711.h"
 #include "app_codec_g722.h"
 #include "app_config.h"
-#include "driver/gpio.h"
 #include "driver/i2s_std.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "es8311_codec.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -26,19 +21,13 @@
 
 typedef struct {
     SemaphoreHandle_t lock;
-    esp_codec_dev_handle_t codec_dev;
-    const audio_codec_data_if_t *data_if;
-    const audio_codec_ctrl_if_t *ctrl_if;
-    const audio_codec_gpio_if_t *gpio_if;
-    const audio_codec_if_t *codec_if;
-    i2c_master_bus_handle_t i2c_bus;
     i2s_chan_handle_t tx_handle;
     app_session_audio_codec_t codec;
     uint32_t sample_rate;
+    uint32_t configured_sample_rate;
     uint8_t channels;
     bool initialized;
     bool codec_stack_inited;
-    bool owns_i2c_bus;
     bool stream_open;
     bool first_frame_logged;
     bool remote_audio_seen;
@@ -54,23 +43,76 @@ typedef struct {
 static const char *TAG = "app_audio_playback";
 static app_audio_playback_ctx_t s_playback;
 
-static i2c_port_num_t app_audio_playback_i2c_port(void)
-{
-    return APP_AUDIO_I2S_ADV_I2C_PORT;
-}
+static esp_err_t app_audio_playback_close_stream_locked(void);
 
 static int app_audio_playback_i2s_port(void)
 {
     return APP_AUDIO_I2S_SPK_PORT;
 }
 
+static void app_audio_playback_effective_gain(int32_t *num, int32_t *den)
+{
+    int32_t configured_num = APP_AUDIO_PLAYBACK_GAIN_NUM;
+    int32_t configured_den = APP_AUDIO_PLAYBACK_GAIN_DEN;
+    int32_t max_num = APP_AUDIO_PLAYBACK_MAX_EFFECTIVE_GAIN_NUM;
+    int32_t max_den = APP_AUDIO_PLAYBACK_MAX_EFFECTIVE_GAIN_DEN;
+
+    if (configured_den <= 0) {
+        configured_den = 1;
+    }
+    if (max_den <= 0) {
+        max_den = 1;
+    }
+    if (((int64_t)configured_num * max_den) > ((int64_t)max_num * configured_den)) {
+        configured_num = max_num;
+        configured_den = max_den;
+    }
+
+    *num = configured_num;
+    *den = configured_den;
+}
+
+static int16_t app_audio_playback_soft_limit(int32_t sample, uint32_t *limited_count)
+{
+    int32_t sign = sample < 0 ? -1 : 1;
+    int32_t magnitude = sample < 0 ? -sample : sample;
+    const int32_t knee = APP_AUDIO_PLAYBACK_SOFT_KNEE;
+    const int32_t limit = APP_AUDIO_PLAYBACK_OUTPUT_LIMIT;
+
+    if (limit <= 0) {
+        return 0;
+    }
+    if (magnitude <= knee || knee >= limit) {
+        if (magnitude > limit) {
+            magnitude = limit;
+            if (limited_count != NULL) {
+                (*limited_count)++;
+            }
+        }
+        return (int16_t)(sign * magnitude);
+    }
+
+    if (limited_count != NULL) {
+        (*limited_count)++;
+    }
+
+    int32_t over = magnitude - knee;
+    int32_t range = limit - knee;
+    magnitude = knee + (over * range) / (over + range);
+    if (magnitude > limit) {
+        magnitude = limit;
+    }
+    return (int16_t)(sign * magnitude);
+}
+
 static esp_err_t app_audio_playback_write_pcm_locked(const int16_t *mono_pcm, size_t sample_count)
 {
     int16_t stereo_pcm[640];
     size_t stereo_count = 0;
-    int err;
+    size_t bytes_written = 0;
+    esp_err_t err;
 
-    if (mono_pcm == NULL || s_playback.codec_dev == NULL) {
+    if (mono_pcm == NULL || s_playback.tx_handle == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (sample_count > 320U) {
@@ -81,8 +123,9 @@ static esp_err_t app_audio_playback_write_pcm_locked(const int16_t *mono_pcm, si
         stereo_pcm[i * 2U + 1U] = mono_pcm[i];
         stereo_count += 2U;
     }
-    err = esp_codec_dev_write(s_playback.codec_dev, stereo_pcm, stereo_count * sizeof(stereo_pcm[0]));
-    return err == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
+    err = i2s_channel_write(s_playback.tx_handle, stereo_pcm, stereo_count * sizeof(stereo_pcm[0]),
+                            &bytes_written, pdMS_TO_TICKS(APP_AUDIO_PLAYBACK_WRITE_TIMEOUT_MS));
+    return err == ESP_OK && bytes_written == (stereo_count * sizeof(stereo_pcm[0])) ? ESP_OK : ESP_FAIL;
 }
 
 static void app_audio_playback_reset_stream_state_locked(void)
@@ -102,20 +145,12 @@ static void app_audio_playback_reset_stream_state_locked(void)
     s_playback.compressed_log_count = 0;
 }
 
-static esp_err_t app_audio_playback_init_codec_locked(void)
+static esp_err_t app_audio_playback_init_codec_locked(uint32_t sample_rate)
 {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = app_audio_playback_i2c_port(),
-        .sda_io_num = APP_AUDIO_I2S_ADV_I2C_SDA_GPIO,
-        .scl_io_num = APP_AUDIO_I2S_ADV_I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(app_audio_playback_i2s_port(), I2S_ROLE_MASTER);
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(8000),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, I2S_SLOT_MODE_STEREO),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = APP_AUDIO_I2S_SPK_BCK_GPIO,
@@ -124,24 +159,24 @@ static esp_err_t app_audio_playback_init_codec_locked(void)
             .din = I2S_GPIO_UNUSED,
         },
     };
-    audio_codec_i2s_cfg_t i2s_cfg = { 0 };
-    audio_codec_i2c_cfg_t i2c_cfg = { 0 };
-    es8311_codec_cfg_t es8311_cfg = { 0 };
-    esp_codec_dev_cfg_t dev_cfg = { 0 };
     esp_err_t err;
 
-    if (s_playback.codec_stack_inited && s_playback.codec_dev != NULL) {
+    chan_cfg.dma_desc_num = 3;
+    chan_cfg.dma_frame_num = 80;
+
+    if (s_playback.codec_stack_inited && s_playback.tx_handle != NULL &&
+        s_playback.configured_sample_rate == sample_rate) {
         return ESP_OK;
     }
 
-    s_playback.i2c_bus = app_audio_adv_codec_get_i2c_bus();
-    if (s_playback.i2c_bus == NULL) {
-        err = i2c_new_master_bus(&bus_cfg, &s_playback.i2c_bus);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to create playback I2C bus: %s", esp_err_to_name(err));
-            return err;
-        }
-        s_playback.owns_i2c_bus = true;
+    if (s_playback.codec_stack_inited) {
+        (void)app_audio_playback_close_stream_locked();
+    }
+
+    err = app_audio_adv_codec_acquire();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to acquire shared ADV codec for playback: %s", esp_err_to_name(err));
+        return err;
     }
 
     chan_cfg.id = app_audio_playback_i2s_port();
@@ -161,130 +196,50 @@ static esp_err_t app_audio_playback_init_codec_locked(void)
         ESP_LOGE(TAG, "Failed to enable playback TX channel: %s", esp_err_to_name(err));
         goto fail;
     }
-
-    i2s_cfg.port = app_audio_playback_i2s_port();
-    i2s_cfg.tx_handle = s_playback.tx_handle;
-    s_playback.data_if = audio_codec_new_i2s_data(&i2s_cfg);
-    if (s_playback.data_if == NULL) {
-        ESP_LOGE(TAG, "audio_codec_new_i2s_data failed");
+    err = app_audio_adv_codec_enable_dac(true, APP_AUDIO_I2S_ADV_DAC_VOLUME_REG);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable shared ADV DAC: %s", esp_err_to_name(err));
         goto fail;
     }
+    app_audio_adv_codec_log_key_regs("after-dac-enable");
 
-    i2c_cfg.port = app_audio_playback_i2c_port();
-    i2c_cfg.addr = ES8311_CODEC_DEFAULT_ADDR;
-    i2c_cfg.bus_handle = s_playback.i2c_bus;
-    s_playback.ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    if (s_playback.ctrl_if == NULL) {
-        ESP_LOGE(TAG, "audio_codec_new_i2c_ctrl failed");
-        goto fail;
-    }
-
-    s_playback.gpio_if = audio_codec_new_gpio();
-    if (s_playback.gpio_if == NULL) {
-        ESP_LOGE(TAG, "audio_codec_new_gpio failed");
-        goto fail;
-    }
-
-    es8311_cfg.codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC;
-    es8311_cfg.ctrl_if = s_playback.ctrl_if;
-    es8311_cfg.gpio_if = s_playback.gpio_if;
-    es8311_cfg.pa_pin = -1;
-    es8311_cfg.use_mclk = false;
-    es8311_cfg.hw_gain.pa_gain = 6.0f;
-    s_playback.codec_if = es8311_codec_new(&es8311_cfg);
-    if (s_playback.codec_if == NULL) {
-        ESP_LOGE(TAG, "es8311_codec_new failed");
-        goto fail;
-    }
-
-    dev_cfg.codec_if = s_playback.codec_if;
-    dev_cfg.data_if = s_playback.data_if;
-    dev_cfg.dev_type = ESP_CODEC_DEV_TYPE_OUT;
-    s_playback.codec_dev = esp_codec_dev_new(&dev_cfg);
-    if (s_playback.codec_dev == NULL) {
-        ESP_LOGE(TAG, "esp_codec_dev_new failed");
-        goto fail;
-    }
-
-    app_audio_adv_codec_set_external_dac_active(true);
-    if (esp_codec_dev_set_out_vol(s_playback.codec_dev, 100) != ESP_CODEC_DEV_OK) {
-        ESP_LOGW(TAG, "Failed to set playback volume to max");
-    }
     s_playback.codec_stack_inited = true;
+    s_playback.configured_sample_rate = sample_rate;
+    ESP_LOGI(TAG, "Opened direct Cardputer playback I2S/DAC path on bck=%d ws=%d dout=%d sample_rate=%u",
+             APP_AUDIO_I2S_SPK_BCK_GPIO, APP_AUDIO_I2S_SPK_WS_GPIO, APP_AUDIO_I2S_SPK_DOUT_GPIO,
+             (unsigned)sample_rate);
     return ESP_OK;
 
 fail:
-    if (s_playback.codec_dev != NULL) {
-        esp_codec_dev_delete(s_playback.codec_dev);
-        s_playback.codec_dev = NULL;
-    }
-    if (s_playback.codec_if != NULL) {
-        audio_codec_delete_codec_if(s_playback.codec_if);
-        s_playback.codec_if = NULL;
-    }
-    if (s_playback.gpio_if != NULL) {
-        audio_codec_delete_gpio_if(s_playback.gpio_if);
-        s_playback.gpio_if = NULL;
-    }
-    if (s_playback.ctrl_if != NULL) {
-        audio_codec_delete_ctrl_if(s_playback.ctrl_if);
-        s_playback.ctrl_if = NULL;
-    }
-    if (s_playback.data_if != NULL) {
-        audio_codec_delete_data_if(s_playback.data_if);
-        s_playback.data_if = NULL;
-    }
     if (s_playback.tx_handle != NULL) {
         i2s_channel_disable(s_playback.tx_handle);
         i2s_del_channel(s_playback.tx_handle);
         s_playback.tx_handle = NULL;
     }
-    if (s_playback.owns_i2c_bus && s_playback.i2c_bus != NULL) {
-        i2c_del_master_bus(s_playback.i2c_bus);
-        s_playback.i2c_bus = NULL;
-        s_playback.owns_i2c_bus = false;
-    }
-    if (!s_playback.owns_i2c_bus) {
-        s_playback.i2c_bus = NULL;
-    }
     s_playback.codec_stack_inited = false;
-    app_audio_adv_codec_set_external_dac_active(false);
-    return ESP_FAIL;
+    s_playback.configured_sample_rate = 0;
+    app_audio_adv_codec_enable_dac(false, APP_AUDIO_I2S_ADV_DAC_VOLUME_REG);
+    app_audio_adv_codec_release();
+    return err;
 }
 
 static esp_err_t app_audio_playback_close_stream_locked(void)
 {
     esp_err_t ret = ESP_OK;
 
-    if (s_playback.codec_dev != NULL && s_playback.stream_open) {
-        int err = esp_codec_dev_close(s_playback.codec_dev);
-        if (err != ESP_CODEC_DEV_OK) {
-            ret = ESP_FAIL;
-        }
-    }
     if (s_playback.codec_stack_inited) {
-        esp_codec_dev_delete(s_playback.codec_dev);
-        s_playback.codec_dev = NULL;
-        audio_codec_delete_codec_if(s_playback.codec_if);
-        s_playback.codec_if = NULL;
-        audio_codec_delete_gpio_if(s_playback.gpio_if);
-        s_playback.gpio_if = NULL;
-        audio_codec_delete_ctrl_if(s_playback.ctrl_if);
-        s_playback.ctrl_if = NULL;
-        audio_codec_delete_data_if(s_playback.data_if);
-        s_playback.data_if = NULL;
         if (s_playback.tx_handle != NULL) {
             i2s_channel_disable(s_playback.tx_handle);
             i2s_del_channel(s_playback.tx_handle);
             s_playback.tx_handle = NULL;
         }
-        if (s_playback.owns_i2c_bus && s_playback.i2c_bus != NULL) {
-            i2c_del_master_bus(s_playback.i2c_bus);
+        if (app_audio_adv_codec_enable_dac(false, APP_AUDIO_I2S_ADV_DAC_VOLUME_REG) != ESP_OK) {
+            ret = ESP_FAIL;
         }
-        s_playback.i2c_bus = NULL;
-        s_playback.owns_i2c_bus = false;
+        app_audio_adv_codec_log_key_regs("after-dac-disable");
+        app_audio_adv_codec_release();
         s_playback.codec_stack_inited = false;
-        app_audio_adv_codec_set_external_dac_active(false);
+        s_playback.configured_sample_rate = 0;
     }
     app_audio_playback_reset_stream_state_locked();
     return ret;
@@ -292,33 +247,16 @@ static esp_err_t app_audio_playback_close_stream_locked(void)
 
 static esp_err_t app_audio_playback_open_stream_locked(uint32_t sample_rate, uint8_t channels)
 {
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = 16,
-        .channel = 2,
-        .channel_mask = 0x03,
-        .sample_rate = sample_rate,
-        .mclk_multiple = 0,
-    };
-    int err;
-
     if (s_playback.stream_open) {
         return ESP_OK;
     }
 
-    if (APP_AUDIO_USE_I2S_MIC && APP_AUDIO_ENABLE_HALF_DUPLEX_GATING) {
-        ESP_LOGI(TAG, "Stopping mic before opening shared speaker path");
-        ESP_RETURN_ON_ERROR(app_audio_i2s_stop(), TAG, "Failed to stop mic before playback");
-    }
-    ESP_RETURN_ON_ERROR(app_audio_playback_init_codec_locked(), TAG, "Failed to init playback codec stack");
-    err = esp_codec_dev_open(s_playback.codec_dev, &fs);
-    if (err != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "esp_codec_dev_open failed: %d", err);
-        return ESP_FAIL;
-    }
+    ESP_RETURN_ON_ERROR(app_audio_playback_init_codec_locked(sample_rate), TAG,
+                        "Failed to init direct playback I2S/DAC path");
 
     s_playback.stream_open = true;
     ESP_LOGI(TAG,
-             "Opened Cardputer playback codec on bck=%d ws=%d dout=%d sample_rate=%u channels=%u",
+             "Opened Cardputer direct playback on bck=%d ws=%d dout=%d sample_rate=%u channels=%u",
              APP_AUDIO_I2S_SPK_BCK_GPIO, APP_AUDIO_I2S_SPK_WS_GPIO, APP_AUDIO_I2S_SPK_DOUT_GPIO,
              (unsigned)sample_rate, (unsigned)channels);
     return ESP_OK;
@@ -401,6 +339,9 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
     int32_t abs_sum = 0;
     int16_t peak = 0;
     uint32_t avg_abs = 0;
+    uint32_t limited_count = 0;
+    int32_t gain_num = 1;
+    int32_t gain_den = 1;
     esp_err_t err;
     bool all_same_encoded = true;
     uint8_t first_encoded = 0;
@@ -411,7 +352,7 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
     if (xSemaphoreTake(s_playback.lock, portMAX_DELAY) != pdTRUE) {
         return;
     }
-    if (!s_playback.stream_open || s_playback.codec_dev == NULL) {
+    if (!s_playback.stream_open || s_playback.tx_handle == NULL) {
         xSemaphoreGive(s_playback.lock);
         return;
     }
@@ -464,15 +405,11 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
         memcpy(decoded_pcm, data, sample_count * sizeof(decoded_pcm[0]));
     }
 
+    app_audio_playback_effective_gain(&gain_num, &gain_den);
     stereo_count = 0;
     for (size_t i = 0; i < sample_count && (i * 2U + 1U) < (sizeof(stereo_pcm) / sizeof(stereo_pcm[0])); i++) {
-        int32_t scaled = ((int32_t)decoded_pcm[i] * APP_AUDIO_PLAYBACK_GAIN_NUM) / APP_AUDIO_PLAYBACK_GAIN_DEN;
-        if (scaled > INT16_MAX) {
-            scaled = INT16_MAX;
-        } else if (scaled < INT16_MIN) {
-            scaled = INT16_MIN;
-        }
-        int16_t sample = (int16_t)scaled;
+        int32_t scaled = ((int32_t)decoded_pcm[i] * gain_num) / gain_den;
+        int16_t sample = app_audio_playback_soft_limit(scaled, &limited_count);
         int16_t magnitude = sample >= 0 ? sample : (int16_t)(-sample);
         abs_sum += magnitude;
         if (magnitude > peak) {
@@ -483,12 +420,15 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
         stereo_count += 2U;
     }
 
-    err = esp_codec_dev_write(s_playback.codec_dev, stereo_pcm, stereo_count * sizeof(stereo_pcm[0]));
-    if (err != ESP_CODEC_DEV_OK) {
+    err = i2s_channel_write(s_playback.tx_handle, stereo_pcm, stereo_count * sizeof(stereo_pcm[0]),
+                            &bytes_written, pdMS_TO_TICKS(APP_AUDIO_PLAYBACK_WRITE_TIMEOUT_MS));
+    if (err != ESP_OK || bytes_written != (stereo_count * sizeof(stereo_pcm[0]))) {
         s_playback.write_error_count++;
-        ESP_LOGW(TAG, "Speaker write failed: %d", err);
+        ESP_LOGW(TAG, "Speaker write failed: %s bytes=%u expected=%u",
+                 esp_err_to_name(err),
+                 (unsigned)bytes_written,
+                 (unsigned)(stereo_count * sizeof(stereo_pcm[0])));
     } else {
-        bytes_written = stereo_count * sizeof(stereo_pcm[0]);
         avg_abs = sample_count ? (unsigned)(abs_sum / (int32_t)sample_count) : 0U;
         s_playback.remote_audio_seen = true;
         s_playback.last_frame_us = esp_timer_get_time();
@@ -502,20 +442,30 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
             s_playback.first_frame_logged = true;
             ESP_LOGI(TAG, "First remote audio frame written to speaker: pts=%u bytes=%u",
                      (unsigned)pts, (unsigned)bytes_written);
-            ESP_LOGI(TAG, "First decoded playback frame stats: samples=%u avg_abs=%u peak=%d gain=%d/%d",
+            ESP_LOGI(TAG, "First decoded playback frame stats: samples=%u avg_abs=%u peak=%d gain=%d/%d configured_gain=%d/%d knee=%d limit=%d limited=%u",
                      (unsigned)sample_count,
                      avg_abs,
                      (int)peak,
+                     (int)gain_num,
+                     (int)gain_den,
                      APP_AUDIO_PLAYBACK_GAIN_NUM,
-                     APP_AUDIO_PLAYBACK_GAIN_DEN);
+                     APP_AUDIO_PLAYBACK_GAIN_DEN,
+                     APP_AUDIO_PLAYBACK_SOFT_KNEE,
+                     APP_AUDIO_PLAYBACK_OUTPUT_LIMIT,
+                     (unsigned)limited_count);
         } else if ((s_playback.write_count % 250U) == 0U) {
-            ESP_LOGI(TAG, "Speaker frames written: %u (errors=%u last_bytes=%u audible_recent=%d avg_abs=%u peak=%d)",
+            ESP_LOGI(TAG, "Speaker frames written: %u (errors=%u last_bytes=%u audible_recent=%d avg_abs=%u peak=%d limited=%u knee=%d limit=%d gain=%d/%d)",
                      (unsigned)s_playback.write_count, (unsigned)s_playback.write_error_count,
                      (unsigned)bytes_written,
                      (avg_abs >= APP_AUDIO_PLAYBACK_ACTIVE_AVG_ABS_THRESHOLD ||
                       peak >= APP_AUDIO_PLAYBACK_ACTIVE_PEAK_THRESHOLD) ? 1 : 0,
                      avg_abs,
-                     (int)peak);
+                     (int)peak,
+                     (unsigned)limited_count,
+                     APP_AUDIO_PLAYBACK_SOFT_KNEE,
+                     APP_AUDIO_PLAYBACK_OUTPUT_LIMIT,
+                     (int)gain_num,
+                     (int)gain_den);
         }
         if (s_playback.decoded_log_count < 4U) {
             s_playback.decoded_log_count++;
@@ -547,7 +497,7 @@ bool app_audio_playback_is_recently_active(uint32_t window_ms)
 
 i2c_master_bus_handle_t app_audio_playback_get_i2c_bus(void)
 {
-    return s_playback.i2c_bus;
+    return app_audio_adv_codec_get_i2c_bus();
 }
 
 esp_err_t app_audio_playback_play_test_tone(uint32_t frequency_hz, uint32_t duration_ms)
@@ -572,7 +522,7 @@ esp_err_t app_audio_playback_play_test_tone(uint32_t frequency_hz, uint32_t dura
     if (!s_playback.stream_open) {
         ret = app_audio_playback_open_stream_locked(sample_rate, 1U);
     }
-    if (ret == ESP_OK && s_playback.codec_dev != NULL) {
+    if (ret == ESP_OK && s_playback.tx_handle != NULL) {
         ESP_LOGI(TAG, "Playing local speaker test tone: freq=%uHz duration=%ums", (unsigned)frequency_hz,
                  (unsigned)duration_ms);
         for (uint32_t frame = 0; frame < total_frames && ret == ESP_OK; frame++) {

@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 typedef struct {
     SemaphoreHandle_t lock;
@@ -23,6 +24,21 @@ typedef struct {
 static const char *TAG = "app_audio_adv_codec";
 static const uint8_t APP_AUDIO_I2S_ADV_ES8311_ADDR = 0x18;
 static app_audio_adv_codec_ctx_t s_adv_codec;
+
+static esp_err_t app_audio_adv_codec_write_reg_locked(uint8_t reg, uint8_t value)
+{
+    uint8_t data[2] = { reg, value };
+
+    ESP_RETURN_ON_FALSE(s_adv_codec.i2c_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "Codec I2C device not ready");
+    return i2c_master_transmit(s_adv_codec.i2c_dev, data, sizeof(data), 100);
+}
+
+static esp_err_t app_audio_adv_codec_read_reg_locked(uint8_t reg, uint8_t *value)
+{
+    ESP_RETURN_ON_FALSE(value != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid codec readback pointer");
+    ESP_RETURN_ON_FALSE(s_adv_codec.i2c_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "Codec I2C device not ready");
+    return i2c_master_transmit_receive(s_adv_codec.i2c_dev, &reg, sizeof(reg), value, 1, 100);
+}
 
 static esp_err_t app_audio_adv_codec_attach_device_locked(i2c_master_bus_handle_t bus)
 {
@@ -240,11 +256,41 @@ unlock:
 esp_err_t app_audio_adv_codec_enable_dac(bool enabled, uint8_t volume_reg)
 {
     uint8_t dac_enable_bulk_data[] = {
+        2, 0x01, 0xBF,
+        2, 0x02, 0x10,
+        2, 0x03, 0x10,
+        2, 0x04, 0x20,
+        2, 0x05, 0x00,
+        2, 0x06, 0x03,
+        2, 0x07, 0x00,
+        2, 0x08, 0xFF,
+        2, 0x0B, 0x00,
+        2, 0x0C, 0x00,
+        2, 0x10, 0x1F,
+        2, 0x11, 0x7F,
+        2, 0x12, 0x00,
+        2, 0x13, 0x10,
+        2, 0x14, 0x1A,
+        2, 0x15, 0x40,
+        2, 0x0D, 0x01,
+        2, 0x31, 0x00,
         2, 0x32, volume_reg,
         2, 0x33, volume_reg,
-        2, 0x37, 0x48,
+        2, 0x37, 0x08,
+        2, 0x44, 0x58,
+        2, 0x45, 0x00,
+        0
+    };
+    static const uint8_t adc_clock_restore_bulk_data[] = {
+        2, 0x01, 0xBA,
+        2, 0x02, 0x18,
+        2, 0x0D, 0x01,
+        2, 0x0E, 0x02,
+        2, 0x14, APP_AUDIO_I2S_ADV_PGA_REG,
+        2, 0x15, 0x00,
+        2, 0x17, APP_AUDIO_I2S_ADV_ADC_VOLUME_REG,
+        2, 0x1C, 0x6A,
         2, 0x44, 0x08,
-        2, 0x45, 0x08,
         0
     };
     esp_err_t ret = ESP_OK;
@@ -253,13 +299,114 @@ esp_err_t app_audio_adv_codec_enable_dac(bool enabled, uint8_t volume_reg)
     ESP_GOTO_ON_FALSE(s_adv_codec.ref_count > 0, ESP_ERR_INVALID_STATE, unlock, TAG, "Codec not acquired");
 
     s_adv_codec.dac_enabled = enabled;
+    ret = app_audio_adv_codec_apply_power_state_locked();
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
     if (enabled) {
         ret = app_audio_adv_codec_write_bulk(dac_enable_bulk_data);
         if (ret != ESP_OK) {
             goto unlock;
         }
+    } else if (s_adv_codec.adc_enabled) {
+        ret = app_audio_adv_codec_write_bulk(adc_clock_restore_bulk_data);
+        if (ret != ESP_OK) {
+            goto unlock;
+        }
     }
+
+unlock:
+    app_audio_adv_codec_unlock();
+    return ret;
+}
+
+esp_err_t app_audio_adv_codec_reset_for_adc(void)
+{
+    static const uint8_t reset_bulk_data[] = {
+        2, 0x00, 0x80,
+        2, 0x01, 0xBA,
+        2, 0x02, 0x18,
+        0
+    };
+    esp_err_t ret;
+
+    ESP_RETURN_ON_ERROR(app_audio_adv_codec_lock(), TAG, "Failed to lock ADV codec");
+    ESP_GOTO_ON_FALSE(s_adv_codec.ref_count > 0, ESP_ERR_INVALID_STATE, unlock, TAG, "Codec not acquired");
+
+    s_adv_codec.adc_enabled = false;
+    s_adv_codec.dac_enabled = false;
+    s_adv_codec.external_dac_active = false;
+    ret = app_audio_adv_codec_write_bulk(reset_bulk_data);
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+
+unlock:
+    app_audio_adv_codec_unlock();
+    return ret;
+}
+
+esp_err_t app_audio_adv_codec_reset_for_adc_recovery(void)
+{
+    static const uint8_t common_init_bulk_data[] = {
+        2, 0x01, 0xBA,
+        2, 0x02, 0x18,
+        0
+    };
+    static const uint8_t adc_enable_bulk_data[] = {
+        2, 0x14, APP_AUDIO_I2S_ADV_PGA_REG,
+        2, 0x17, APP_AUDIO_I2S_ADV_ADC_VOLUME_REG,
+        2, 0x1C, 0x6A,
+        0
+    };
+    static const uint8_t readback_regs[] = { 0x00, 0x01, 0x02, 0x0D, 0x0E, 0x14, 0x17, 0x1C };
+    uint8_t readback[sizeof(readback_regs)] = { 0 };
+    esp_err_t ret;
+
+    ESP_RETURN_ON_ERROR(app_audio_adv_codec_lock(), TAG, "Failed to lock ADV codec");
+    ESP_GOTO_ON_FALSE(s_adv_codec.ref_count > 0, ESP_ERR_INVALID_STATE, unlock, TAG, "Codec not acquired");
+
+    ESP_LOGI(TAG, "Recovering Cardputer ADV ES8311 ADC after DAC playback");
+    s_adv_codec.adc_enabled = false;
+    s_adv_codec.dac_enabled = false;
+    s_adv_codec.external_dac_active = false;
     ret = app_audio_adv_codec_apply_power_state_locked();
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+
+    ret = app_audio_adv_codec_write_reg_locked(0x00, 0x80);
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_I2S_ADV_CODEC_RESET_DELAY_MS));
+
+    ret = app_audio_adv_codec_write_bulk(common_init_bulk_data);
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+    ret = app_audio_adv_codec_write_bulk(adc_enable_bulk_data);
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+    s_adv_codec.adc_enabled = true;
+    ret = app_audio_adv_codec_apply_power_state_locked();
+    if (ret != ESP_OK) {
+        goto unlock;
+    }
+
+    for (size_t i = 0; i < sizeof(readback_regs); i++) {
+        ret = app_audio_adv_codec_read_reg_locked(readback_regs[i], &readback[i]);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ES8311 ADC recovery readback failed at reg 0x%02X: %s",
+                     (unsigned)readback_regs[i], esp_err_to_name(ret));
+            goto unlock;
+        }
+    }
+    ESP_LOGI(TAG,
+             "ES8311 ADC recovery readback: 00=0x%02X 01=0x%02X 02=0x%02X 0D=0x%02X 0E=0x%02X 14=0x%02X 17=0x%02X 1C=0x%02X",
+             readback[0], readback[1], readback[2], readback[3],
+             readback[4], readback[5], readback[6], readback[7]);
 
 unlock:
     app_audio_adv_codec_unlock();
@@ -280,5 +427,38 @@ void app_audio_adv_codec_set_external_dac_active(bool active)
     if (s_adv_codec.ref_count > 0 && s_adv_codec.i2c_dev != NULL) {
         (void)app_audio_adv_codec_apply_power_state_locked();
     }
+    app_audio_adv_codec_unlock();
+}
+
+void app_audio_adv_codec_log_key_regs(const char *label)
+{
+    static const uint8_t regs[] = {
+        0x00, 0x01, 0x02, 0x09, 0x0A, 0x0D, 0x0E, 0x12,
+        0x14, 0x15, 0x17, 0x1C, 0x31, 0x32, 0x33, 0x37, 0x44, 0x45
+    };
+    uint8_t values[sizeof(regs)] = { 0 };
+
+    if (app_audio_adv_codec_lock() != ESP_OK) {
+        return;
+    }
+    if (s_adv_codec.ref_count == 0 || s_adv_codec.i2c_dev == NULL) {
+        app_audio_adv_codec_unlock();
+        return;
+    }
+    for (size_t i = 0; i < sizeof(regs); i++) {
+        if (app_audio_adv_codec_read_reg_locked(regs[i], &values[i]) != ESP_OK) {
+            ESP_LOGW(TAG, "ES8311 %s readback failed at reg 0x%02X",
+                     label != NULL ? label : "key",
+                     (unsigned)regs[i]);
+            app_audio_adv_codec_unlock();
+            return;
+        }
+    }
+    ESP_LOGI(TAG,
+             "ES8311 %s regs: 00=%02X 01=%02X 02=%02X 09=%02X 0A=%02X 0D=%02X 0E=%02X 12=%02X 14=%02X 15=%02X 17=%02X 1C=%02X 31=%02X 32=%02X 33=%02X 37=%02X 44=%02X 45=%02X",
+             label != NULL ? label : "key",
+             values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
+             values[8], values[9], values[10], values[11], values[12], values[13], values[14],
+             values[15], values[16], values[17]);
     app_audio_adv_codec_unlock();
 }

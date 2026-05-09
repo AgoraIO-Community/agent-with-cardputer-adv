@@ -10,7 +10,6 @@
 #include "app_codec_g722.h"
 #include "app_config.h"
 #include "app_audio_adv_codec.h"
-#include "app_audio_playback.h"
 #include "app_session.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
@@ -33,7 +32,6 @@
 
 #define APP_AUDIO_I2S_STACK_SIZE 6144
 #define APP_AUDIO_I2S_READ_TIMEOUT_MS 100
-#define APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS 1000U
 #define APP_AUDIO_I2S_PLL_D2_CLK 120000000U
 #define APP_AUDIO_I2S_OVERSAMPLING 2
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
@@ -52,7 +50,13 @@ typedef struct {
     uint8_t mode_index;
     uint8_t constant_frame_reports;
     uint8_t tuned_mode_mask;
+    uint8_t known_good_mode_index;
     bool mode_locked;
+    bool post_playback_recovery;
+    bool recovery_retry_used;
+    bool recovery_failure_logged;
+    bool adv_adc_kept_on_for_playback;
+    int64_t suppress_autotune_until_us;
 #if APP_AUDIO_I2S_PROFILE_ENABLE
     uint32_t profile_window_frames;
     uint32_t profile_send_failures;
@@ -282,9 +286,21 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
     {
         i2s_std_config_t std_rx_cfg = { 0 };
+        bool adc_recovery = s_audio_i2s.post_playback_recovery;
+        bool adc_kept_on = s_audio_i2s.adv_adc_kept_on_for_playback;
 
-        ESP_RETURN_ON_ERROR(app_audio_adv_codec_acquire(), TAG, "Failed to acquire ADV codec");
-        ESP_RETURN_ON_ERROR(app_audio_adv_codec_enable_adc(true), TAG, "Failed to enable ADV codec ADC");
+        if (!adc_kept_on) {
+            ESP_RETURN_ON_ERROR(app_audio_adv_codec_acquire(), TAG, "Failed to acquire ADV codec");
+            if (adc_recovery) {
+                ESP_RETURN_ON_ERROR(app_audio_adv_codec_reset_for_adc_recovery(), TAG,
+                                    "Failed to recover ADV codec ADC after playback");
+            } else {
+                ESP_RETURN_ON_ERROR(app_audio_adv_codec_reset_for_adc(), TAG, "Failed to reset ADV codec for ADC");
+                ESP_RETURN_ON_ERROR(app_audio_adv_codec_enable_adc(true), TAG, "Failed to enable ADV codec ADC");
+            }
+        } else {
+            ESP_LOGI(TAG, "Reusing powered ADV ADC after playback; skipping codec reset and ADC enable");
+        }
         std_rx_cfg.clk_cfg.sample_rate_hz = APP_AUDIO_I2S_CAPTURE_RATE;
         std_rx_cfg.clk_cfg.clk_src = I2S_CLK_SRC_PLL_160M;
         std_rx_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
@@ -312,14 +328,18 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
             return err;
         }
         ESP_RETURN_ON_ERROR(i2s_channel_enable(s_audio_i2s.rx_handle), TAG, "Failed to enable ADV I2S RX channel");
-        vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_I2S_ADV_STARTUP_DELAY_MS));
-        ESP_LOGI(TAG, "Initialized Cardputer ADV mic I2S RX on bck=%d ws=%d data=%d capture_rate=%d send_rate=%d slot=%s ws_inv=%d bclk_inv=%d (%s)",
+        vTaskDelay(pdMS_TO_TICKS(adc_recovery
+                                 ? APP_AUDIO_I2S_ADV_ADC_SETTLE_DELAY_MS
+                                 : APP_AUDIO_I2S_ADV_STARTUP_DELAY_MS));
+        ESP_LOGI(TAG, "Initialized Cardputer ADV mic I2S RX on bck=%d ws=%d data=%d capture_rate=%d send_rate=%d slot=%s ws_inv=%d bclk_inv=%d (%s recovery=%d kept_on=%d)",
                  APP_AUDIO_I2S_MIC_BCK_GPIO, APP_AUDIO_I2S_MIC_CLK_GPIO, APP_AUDIO_I2S_MIC_DATA_GPIO,
                  APP_AUDIO_I2S_CAPTURE_RATE, APP_AUDIO_SAMPLE_RATE,
                  mode->left_slot ? "left" : "right",
                  mode->ws_inv ? 1 : 0,
                  mode->clk_inv ? 1 : 0,
-                 mode->name);
+                 mode->name,
+                 adc_recovery ? 1 : 0,
+                 adc_kept_on ? 1 : 0);
     }
 #else
     {
@@ -362,6 +382,19 @@ static void app_audio_i2s_deinit_channel(void)
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
     app_audio_adv_codec_enable_adc(false);
     app_audio_adv_codec_release();
+#endif
+}
+
+static void app_audio_i2s_deinit_rx_channel_keep_adv_adc(void)
+{
+    if (s_audio_i2s.rx_handle == NULL) {
+        return;
+    }
+    i2s_channel_disable(s_audio_i2s.rx_handle);
+    i2s_del_channel(s_audio_i2s.rx_handle);
+    s_audio_i2s.rx_handle = NULL;
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+    s_audio_i2s.adv_adc_kept_on_for_playback = true;
 #endif
 }
 
@@ -436,6 +469,83 @@ static size_t app_audio_i2s_resample_frame(const int16_t *input,
     return 0;
 }
 
+static void app_audio_i2s_log_warmup_stats(int16_t *buffer, size_t buffer_size)
+{
+    int64_t abs_sum = 0;
+    int32_t peak = 0;
+    int16_t first_sample = 0;
+    bool have_sample = false;
+    bool all_same = true;
+    size_t total_samples = 0;
+
+    for (uint32_t read_index = 0; read_index < APP_AUDIO_I2S_ADV_RESTART_FLUSH_READS; read_index++) {
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_audio_i2s.rx_handle, buffer, buffer_size,
+                                         &bytes_read, pdMS_TO_TICKS(10));
+        if (err != ESP_OK || bytes_read == 0) {
+            ESP_LOGW(TAG, "Mic warmup flush read %u failed: %s bytes=%u",
+                     (unsigned)(read_index + 1U),
+                     esp_err_to_name(err),
+                     (unsigned)bytes_read);
+            continue;
+        }
+
+        size_t sample_count = bytes_read / sizeof(buffer[0]);
+        for (size_t i = 0; i < sample_count; i++) {
+            int32_t sample = buffer[i];
+            int32_t magnitude = sample < 0 ? -sample : sample;
+            if (!have_sample) {
+                first_sample = buffer[i];
+                have_sample = true;
+            } else if (buffer[i] != first_sample) {
+                all_same = false;
+            }
+            if (magnitude > peak) {
+                peak = magnitude;
+            }
+            abs_sum += magnitude;
+            total_samples++;
+        }
+    }
+
+    ESP_LOGI(TAG, "Mic warmup flush stats: reads=%u samples=%u avg_abs=%u peak=%u first_sample=%d all_same=%d recovery=%d",
+             (unsigned)APP_AUDIO_I2S_ADV_RESTART_FLUSH_READS,
+             (unsigned)total_samples,
+             total_samples ? (unsigned)(abs_sum / (int64_t)total_samples) : 0U,
+             (unsigned)peak,
+             have_sample ? (int)first_sample : 0,
+             all_same ? 1 : 0,
+             s_audio_i2s.post_playback_recovery ? 1 : 0);
+}
+
+static bool app_audio_i2s_autotune_suppressed(void)
+{
+    return s_audio_i2s.suppress_autotune_until_us != 0 &&
+        esp_timer_get_time() < s_audio_i2s.suppress_autotune_until_us;
+}
+
+static esp_err_t app_audio_i2s_retry_adc_recovery(void)
+{
+    int16_t warmup_buffer[APP_AUDIO_I2S_READ_SAMPLES_PER_FRAME];
+    uint8_t mode_index = s_audio_i2s.known_good_mode_index %
+        (sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]));
+    esp_err_t err;
+
+    ESP_LOGW(TAG, "Retrying ADV mic ADC recovery in known-good mode %s",
+             s_audio_i2s_modes[mode_index].name);
+    app_audio_i2s_deinit_channel();
+    s_audio_i2s.mode_index = mode_index;
+    s_audio_i2s.constant_frame_reports = 0;
+    s_audio_i2s.post_playback_recovery = true;
+    s_audio_i2s.suppress_autotune_until_us =
+        esp_timer_get_time() + ((int64_t)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS * 1000LL);
+    err = app_audio_i2s_init_channel_for_mode(&s_audio_i2s_modes[mode_index]);
+    if (err == ESP_OK) {
+        app_audio_i2s_log_warmup_stats(warmup_buffer, sizeof(warmup_buffer));
+    }
+    return err;
+}
+
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
 static size_t app_audio_i2s_expand_mono_to_stereo(const int16_t *input,
                                                   size_t input_count,
@@ -465,7 +575,6 @@ static void app_audio_i2s_task(void *arg)
     static int16_t stereo_frame_buffer[((APP_AUDIO_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000U) * 2U];
 #endif
     bool waiting_logged = false;
-    bool uplink_gated = false;
 
     (void)arg;
     memset(raw_frame_buffer, 0, sizeof(raw_frame_buffer));
@@ -475,9 +584,7 @@ static void app_audio_i2s_task(void *arg)
     memset(stereo_frame_buffer, 0, sizeof(stereo_frame_buffer));
 #endif
 
-    size_t warmup_bytes = 0;
-    i2s_channel_read(s_audio_i2s.rx_handle, raw_frame_buffer, sizeof(raw_frame_buffer), &warmup_bytes, pdMS_TO_TICKS(1));
-    i2s_channel_read(s_audio_i2s.rx_handle, raw_frame_buffer, sizeof(raw_frame_buffer), &warmup_bytes, pdMS_TO_TICKS(1));
+    app_audio_i2s_log_warmup_stats(raw_frame_buffer, sizeof(raw_frame_buffer));
 
     while (s_audio_i2s.running) {
         size_t bytes_read = 0;
@@ -589,22 +696,6 @@ static void app_audio_i2s_task(void *arg)
         }
         waiting_logged = false;
 
-        bool uplink_gated_this_frame = app_audio_playback_is_recently_active(APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS);
-        if (uplink_gated_this_frame) {
-            if (!uplink_gated) {
-                uplink_gated = true;
-                ESP_LOGI(TAG, "Remote audio active, muting mic uplink with silence frames");
-            }
-        } else if (uplink_gated) {
-            uplink_gated = false;
-            ESP_LOGI(TAG, "Remote audio inactive for %u ms, resuming live mic uplink",
-                     (unsigned)APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS);
-        }
-
-        if (uplink_gated_this_frame) {
-            memset(frame_buffer, 0, sample_count * sizeof(frame_buffer[0]));
-        }
-
         if (!s_audio_i2s.running) {
             break;
         }
@@ -618,12 +709,11 @@ static void app_audio_i2s_task(void *arg)
             frame_data = encoded_frame;
             if (frame_size != samples_per_frame) {
                 ESP_LOGE(TAG,
-                         "Unexpected G711A uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u gated=%d",
+                         "Unexpected G711A uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u",
                          (unsigned)frame_size,
                          (unsigned)samples_per_frame,
                          (unsigned)sample_count,
-                         (unsigned)bytes_read,
-                         uplink_gated ? 1 : 0);
+                         (unsigned)bytes_read);
                 continue;
             }
 #elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
@@ -632,12 +722,11 @@ static void app_audio_i2s_task(void *arg)
             frame_data = encoded_frame;
             if (frame_size != (sample_count / 2U)) {
                 ESP_LOGE(TAG,
-                         "Unexpected G722 uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u gated=%d",
+                         "Unexpected G722 uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u",
                          (unsigned)frame_size,
                          (unsigned)(sample_count / 2U),
                          (unsigned)sample_count,
-                         (unsigned)bytes_read,
-                         uplink_gated ? 1 : 0);
+                         (unsigned)bytes_read);
                 continue;
             }
 #elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
@@ -684,10 +773,11 @@ static void app_audio_i2s_task(void *arg)
         if ((s_audio_i2s.processed_frame_count % (5000U / APP_AUDIO_FRAME_MS)) == 0U) {
             uint32_t raw_avg_abs = sample_count ? (uint32_t)(raw_abs_sum / (int64_t)sample_count) : 0U;
             uint32_t avg_abs = sample_count ? (uint32_t)(abs_sum / (int64_t)sample_count) : 0U;
-            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u uplink_gated=%d (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d)",
+            bool near_zero = raw_avg_abs <= 8U && raw_peak <= 32;
+            bool constant_or_near_zero = all_same || near_zero;
+            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d)",
                      (unsigned)s_audio_i2s.processed_frame_count,
                      (unsigned)s_audio_i2s.sent_frame_count,
-                     uplink_gated ? 1 : 0,
                      (unsigned)bytes_read,
                      (unsigned)raw_avg_abs, (unsigned)raw_peak,
                      (unsigned)avg_abs, (unsigned)peak, (unsigned)zero_crossings, (int)first_sample,
@@ -711,11 +801,38 @@ static void app_audio_i2s_task(void *arg)
                 s_audio_i2s.profile_total_frame_time_us = 0;
             }
 #endif
-            if (all_same) {
+            if (constant_or_near_zero) {
                 s_audio_i2s.constant_frame_reports++;
-                ESP_LOGW(TAG, "Mic frame appears constant-valued (%u reports)", (unsigned)s_audio_i2s.constant_frame_reports);
+                ESP_LOGW(TAG, "Mic frame appears constant or near-zero (%u reports, near_zero=%d, post_playback=%d)",
+                         (unsigned)s_audio_i2s.constant_frame_reports,
+                         near_zero ? 1 : 0,
+                         s_audio_i2s.post_playback_recovery ? 1 : 0);
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV && APP_AUDIO_I2S_ADV_RECOVERY_RETRY_ENABLE
+                if (s_audio_i2s.post_playback_recovery &&
+                    s_audio_i2s.constant_frame_reports >= 2 &&
+                    !s_audio_i2s.recovery_retry_used) {
+                    s_audio_i2s.recovery_retry_used = true;
+                    if (app_audio_i2s_retry_adc_recovery() != ESP_OK) {
+                        if (!s_audio_i2s.recovery_failure_logged) {
+                            s_audio_i2s.recovery_failure_logged = true;
+                            ESP_LOGE(TAG, "ADV mic recovery failed after playback");
+                        }
+                    }
+                    continue;
+                }
+                if (s_audio_i2s.post_playback_recovery &&
+                    s_audio_i2s.constant_frame_reports >= 2 &&
+                    s_audio_i2s.recovery_retry_used &&
+                    !s_audio_i2s.recovery_failure_logged) {
+                    s_audio_i2s.recovery_failure_logged = true;
+                    ESP_LOGE(TAG, "ADV mic recovery failed after playback");
+                }
+#endif
 #if APP_AUDIO_I2S_AUTO_TUNE
-                if (!s_audio_i2s.mode_locked && s_audio_i2s.constant_frame_reports >= 2) {
+                if (s_audio_i2s.post_playback_recovery || app_audio_i2s_autotune_suppressed()) {
+                    ESP_LOGW(TAG, "Cardputer mic auto-tune suppressed during post-playback ADC recovery; keeping %s",
+                             s_audio_i2s_modes[s_audio_i2s.mode_index].name);
+                } else if (!s_audio_i2s.mode_locked && s_audio_i2s.constant_frame_reports >= 2) {
                     uint8_t next_mode = app_audio_i2s_find_next_allowed_mode(s_audio_i2s.mode_index);
                     if (next_mode == s_audio_i2s.mode_index ||
                         (s_audio_i2s.tuned_mode_mask & (uint8_t)(1U << next_mode)) != 0U) {
@@ -738,7 +855,15 @@ static void app_audio_i2s_task(void *arg)
 #endif
             } else if (!s_audio_i2s.mode_locked) {
                 s_audio_i2s.mode_locked = true;
+                s_audio_i2s.known_good_mode_index = s_audio_i2s.mode_index;
+                s_audio_i2s.post_playback_recovery = false;
+                s_audio_i2s.suppress_autotune_until_us = 0;
                 ESP_LOGI(TAG, "Cardputer mic mode appears non-constant, keeping %s",
+                         s_audio_i2s_modes[s_audio_i2s.mode_index].name);
+            } else if (s_audio_i2s.post_playback_recovery) {
+                s_audio_i2s.post_playback_recovery = false;
+                s_audio_i2s.suppress_autotune_until_us = 0;
+                ESP_LOGI(TAG, "ADV mic recovered after playback in known-good mode %s",
                          s_audio_i2s_modes[s_audio_i2s.mode_index].name);
             }
         }
@@ -756,15 +881,40 @@ esp_err_t app_audio_i2s_start(void)
         return ESP_OK;
     }
 
-    s_audio_i2s.mode_index = app_audio_i2s_initial_mode_index();
+    if (s_audio_i2s.known_good_mode_index >= (sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]))) {
+        s_audio_i2s.known_good_mode_index = app_audio_i2s_initial_mode_index();
+    }
+    if (s_audio_i2s.post_playback_recovery) {
+        s_audio_i2s.mode_index = s_audio_i2s.known_good_mode_index;
+        s_audio_i2s.mode_locked = true;
+        s_audio_i2s.suppress_autotune_until_us =
+            esp_timer_get_time() + ((int64_t)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS * 1000LL);
+        ESP_LOGI(TAG, "Starting ADV mic post-playback recovery in known-good mode %s; auto-tune suppressed for %ums",
+                 s_audio_i2s_modes[s_audio_i2s.mode_index].name,
+                 (unsigned)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS);
+    } else if (s_audio_i2s.adv_adc_kept_on_for_playback) {
+        s_audio_i2s.mode_index = s_audio_i2s.known_good_mode_index;
+        s_audio_i2s.mode_locked = true;
+        s_audio_i2s.suppress_autotune_until_us =
+            esp_timer_get_time() + ((int64_t)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS * 1000LL);
+        ESP_LOGI(TAG, "Resuming ADV mic with ADC kept on in known-good mode %s; auto-tune suppressed for %ums",
+                 s_audio_i2s_modes[s_audio_i2s.mode_index].name,
+                 (unsigned)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS);
+    } else {
+        s_audio_i2s.mode_index = app_audio_i2s_initial_mode_index();
+        s_audio_i2s.mode_locked = false;
+        s_audio_i2s.suppress_autotune_until_us = 0;
+    }
     s_audio_i2s.constant_frame_reports = 0;
     s_audio_i2s.tuned_mode_mask = (uint8_t)(1U << s_audio_i2s.mode_index);
-    s_audio_i2s.mode_locked = false;
+    s_audio_i2s.recovery_retry_used = false;
+    s_audio_i2s.recovery_failure_logged = false;
 
     err = app_audio_i2s_init_channel_for_mode(&s_audio_i2s_modes[s_audio_i2s.mode_index]);
     if (err != ESP_OK) {
         return err;
     }
+    s_audio_i2s.adv_adc_kept_on_for_playback = false;
 
     s_audio_i2s.running = true;
     s_audio_i2s.processed_frame_count = 0;
@@ -784,12 +934,68 @@ esp_err_t app_audio_i2s_start(void)
     return ESP_OK;
 }
 
-esp_err_t app_audio_i2s_stop(void)
+void app_audio_i2s_mark_post_playback_recovery(void)
 {
+    if (s_audio_i2s.known_good_mode_index >= (sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]))) {
+        s_audio_i2s.known_good_mode_index = app_audio_i2s_initial_mode_index();
+    }
+    s_audio_i2s.post_playback_recovery = true;
+    s_audio_i2s.recovery_retry_used = false;
+    s_audio_i2s.recovery_failure_logged = false;
+    s_audio_i2s.constant_frame_reports = 0;
+    s_audio_i2s.suppress_autotune_until_us =
+        esp_timer_get_time() + ((int64_t)APP_AUDIO_I2S_ADV_POST_PLAYBACK_AUTOTUNE_SUPPRESS_MS * 1000LL);
+    ESP_LOGI(TAG, "Marked next ADV mic start as post-playback ADC recovery; known_good_mode=%s",
+             s_audio_i2s_modes[s_audio_i2s.known_good_mode_index].name);
+}
+
+esp_err_t app_audio_i2s_pause_for_playback(void)
+{
+    TaskHandle_t task;
+
     if (!s_audio_i2s.running) {
         return ESP_OK;
     }
+    if (s_audio_i2s.known_good_mode_index >= (sizeof(s_audio_i2s_modes) / sizeof(s_audio_i2s_modes[0]))) {
+        s_audio_i2s.known_good_mode_index = s_audio_i2s.mode_index;
+    }
     s_audio_i2s.running = false;
+    task = s_audio_i2s.task;
+    for (uint32_t i = 0; task != NULL && s_audio_i2s.task != NULL && i < 50U; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_audio_i2s.task != NULL) {
+        ESP_LOGW(TAG, "Mic task did not exit before playback pause timeout; deinitializing RX anyway");
+    }
+    app_audio_i2s_deinit_rx_channel_keep_adv_adc();
+    ESP_LOGI(TAG, "Paused ADV mic RX for playback while keeping ES8311 ADC powered in mode %s",
+             s_audio_i2s_modes[s_audio_i2s.known_good_mode_index].name);
+    return ESP_OK;
+}
+
+esp_err_t app_audio_i2s_stop(void)
+{
+    TaskHandle_t task;
+
+    if (!s_audio_i2s.running) {
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+        if (s_audio_i2s.adv_adc_kept_on_for_playback) {
+            s_audio_i2s.adv_adc_kept_on_for_playback = false;
+            app_audio_adv_codec_enable_adc(false);
+            app_audio_adv_codec_release();
+        }
+#endif
+        return ESP_OK;
+    }
+    s_audio_i2s.running = false;
+    task = s_audio_i2s.task;
+    for (uint32_t i = 0; task != NULL && s_audio_i2s.task != NULL && i < 50U; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_audio_i2s.task != NULL) {
+        ESP_LOGW(TAG, "Mic task did not exit before stop timeout; deinitializing I2S anyway");
+    }
     app_audio_i2s_deinit_channel();
+    s_audio_i2s.adv_adc_kept_on_for_playback = false;
     return ESP_OK;
 }

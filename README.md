@@ -13,6 +13,7 @@ ESP32-S3 / M5Stack Cardputer audio client using Agora RTSA plus a local protocol
 - [x] M6: fake audio publisher sends frames over the RTSA path
 - [x] M7: real Cardputer microphone integration on the stable G.711A path
 - [x] M8: pull playback works on the Cardputer ADV speaker path
+- [x] M9: official half-duplex audio switching for shared mic/speaker hardware
 
 Hardware-verified status on May 9, 2026:
 - protocol config fetch succeeds
@@ -22,6 +23,7 @@ Hardware-verified status on May 9, 2026:
 - Cardputer ADV microphone capture works on hardware
 - live mic frames are sent continuously over the G.711A path
 - remote agent audio is received and played through the ADV speaker path
+- remote playback now switches mic/speaker ownership instead of keeping both active
 
 ## Build
 
@@ -72,9 +74,10 @@ For local development:
 4. Joins the RTSA channel with the returned token and IDs
 5. Starts or stops the remote agent through `/v2/startAgent` and `/v2/stopAgent`
 6. Plays received remote audio through the Cardputer ADV ES8311 speaker path when playback is enabled
-7. Sends fake audio frames by default, or can start the real Cardputer ADV I2S mic path when `APP_AUDIO_USE_I2S_MIC` is enabled
-8. Uses G.711A as the stable codec baseline for live mic publish
-9. Auto-tunes Cardputer ADV mic framing across the known slot / inversion variants if the first capture mode looks constant-valued
+7. Uses controller-managed half-duplex switching on shared audio hardware: mic active in record mode, speaker active in playback mode
+8. Sends fake audio frames by default, or can start the real Cardputer ADV I2S mic path when `APP_AUDIO_USE_I2S_MIC` is enabled
+9. Uses G.711A as the stable codec baseline for live mic publish
+10. Auto-tunes Cardputer ADV mic framing across the known slot / inversion variants if the first capture mode looks constant-valued
 
 ## Expected Serial Milestones
 
@@ -94,6 +97,9 @@ For remote speaker playback, you should also see lines like:
 - `Remote audio stream callback fired: codec=1 sample_rate=8000 channels=1`
 - `Opened Cardputer playback codec on bck=41 ws=43 dout=42 ...`
 - `First remote audio frame written to speaker: ...`
+- `Audio mode -> PLAYBACK`
+- `Silence uplink frames sent during playback: ...`
+- `Audio mode -> RECORDING`
 
 For the real mic path, you should instead see lines like:
 
@@ -112,8 +118,8 @@ If the initial ADV framing is wrong, you may also see lines like:
 - The display is not used yet.
 - Local Wi-Fi and protocol values must be supplied through `src/app_config_local.h`.
 - The stable live-mic path currently uses `APP_AUDIO_CODEC_G711A`.
-- Full-duplex mic plus playback on this board remains sensitive because the ADV audio path shares hardware resources and memory is tight without PSRAM.
-- The tracked example config is intentionally set to the known-good G.711A baseline without pull playback enabled by default.
+- The board now runs in logical half-duplex for shared mic/speaker hardware. During playback, the firmware sends silence uplink frames instead of keeping the mic hardware active.
+- Half-duplex gating is enabled by default. Pull playback is still off in the tracked example config until explicitly enabled locally.
 
 ## Next Step
 
@@ -122,6 +128,7 @@ Use the known-good Cardputer ADV mic baseline:
 1. Set these in `src/app_config_local.h`:
    - `APP_AUDIO_USE_I2S_MIC 1`
    - `APP_AUDIO_CODEC APP_AUDIO_CODEC_G711A`
+   - `APP_AUDIO_ENABLE_HALF_DUPLEX_GATING 1`
    - `APP_AUDIO_I2S_USE_CARDPUTER_ADV 1`
    - `APP_AUDIO_I2S_PORT I2S_NUM_1`
    - `APP_AUDIO_I2S_MIC_BCK_GPIO GPIO_NUM_41`

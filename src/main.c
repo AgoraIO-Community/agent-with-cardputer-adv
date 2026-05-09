@@ -1,9 +1,8 @@
 #include <ctype.h>
 
+#include "app_audio_controller.h"
 #include "app_audio_playback.h"
 #include "app_audio_adv_codec.h"
-#include "app_audio_i2s.h"
-#include "app_audio_fake.h"
 #include "app_config.h"
 #include "app_https.h"
 #include "app_protocol.h"
@@ -74,7 +73,7 @@ static void app_main_on_pull_audio_info(app_session_audio_codec_t codec,
                                         void *ctx)
 {
     (void)ctx;
-    app_audio_playback_handle_stream_info(codec, sample_rate, channels);
+    app_audio_controller_handle_remote_stream_info(codec, sample_rate, channels);
 }
 
 static void app_main_on_pull_audio_frame(app_session_audio_codec_t codec,
@@ -84,7 +83,7 @@ static void app_main_on_pull_audio_frame(app_session_audio_codec_t codec,
                                          void *ctx)
 {
     (void)ctx;
-    app_audio_playback_handle_audio_frame(codec, data, size, pts);
+    app_audio_controller_handle_remote_audio_frame(codec, data, size, pts);
 }
 
 static esp_err_t app_validate_runtime_config(void)
@@ -339,34 +338,6 @@ static esp_err_t app_wait_for_toggle_key_press(void)
     }
 }
 
-static esp_err_t app_main_stop_local_audio(bool *audio_started)
-{
-    if (audio_started == NULL || !*audio_started) {
-        return ESP_OK;
-    }
-    if (APP_AUDIO_USE_I2S_MIC) {
-        ESP_RETURN_ON_ERROR(app_audio_i2s_stop(), TAG, "Failed to stop mic audio");
-    } else {
-        ESP_RETURN_ON_ERROR(app_audio_fake_stop(), TAG, "Failed to stop fake audio");
-    }
-    *audio_started = false;
-    return ESP_OK;
-}
-
-static esp_err_t app_main_start_local_audio(bool *audio_started)
-{
-    if (audio_started == NULL || *audio_started) {
-        return ESP_OK;
-    }
-    if (APP_AUDIO_USE_I2S_MIC) {
-        ESP_RETURN_ON_ERROR(app_audio_i2s_start(), TAG, "Failed to start mic audio");
-    } else {
-        ESP_RETURN_ON_ERROR(app_audio_fake_start(), TAG, "Failed to start fake audio");
-    }
-    *audio_started = true;
-    return ESP_OK;
-}
-
 void app_main(void)
 {
     app_protocol_config_t protocol_cfg = { 0 };
@@ -394,12 +365,8 @@ void app_main(void)
         ESP_ERROR_CHECK(app_session_set_audio_receive_callbacks(app_main_on_pull_audio_info,
                                                                 app_main_on_pull_audio_frame,
                                                                 NULL));
-        ESP_ERROR_CHECK(app_audio_playback_init());
-#if APP_AUDIO_PLAYBACK_RUN_SELF_TEST
-        ESP_ERROR_CHECK(app_audio_playback_run_self_test_pattern());
-        ESP_ERROR_CHECK(app_audio_playback_stop());
-#endif
     }
+    ESP_ERROR_CHECK(app_audio_controller_init());
     ESP_ERROR_CHECK(app_rtsa_start(&protocol_cfg));
     if (APP_AGORA_AUTO_START) {
 #if APP_AGORA_START_ON_KEYPRESS
@@ -409,13 +376,15 @@ void app_main(void)
         agent_started = true;
     }
 
-    ESP_ERROR_CHECK(app_main_start_local_audio(&audio_started));
+    ESP_ERROR_CHECK(app_audio_controller_start());
+    audio_started = true;
 
 #if APP_AUDIO_ENABLE_PULL_PLAYBACK
     if (agent_started && audio_started) {
         ESP_LOGI(TAG, "Playback armed; speak into the mic to elicit agent audio");
         vTaskDelay(pdMS_TO_TICKS(10000));
-        if (!app_audio_playback_has_received_audio()) {
+        if (!app_audio_controller_has_received_remote_audio() &&
+            !app_audio_controller_is_in_playback()) {
             ESP_LOGW(TAG, "No remote audio received within 10s after local audio start");
         }
     }
@@ -426,10 +395,8 @@ void app_main(void)
         if (agent_started) {
             ESP_LOGI(TAG, "Press '%c' again to stop the agent", APP_AGORA_START_KEY);
             ESP_ERROR_CHECK(app_wait_for_toggle_key_press());
-            ESP_ERROR_CHECK(app_main_stop_local_audio(&audio_started));
-#if APP_AUDIO_ENABLE_PULL_PLAYBACK
-            ESP_ERROR_CHECK(app_audio_playback_stop());
-#endif
+            ESP_ERROR_CHECK(app_audio_controller_stop());
+            audio_started = false;
             ESP_ERROR_CHECK(app_protocol_stop_agent(&protocol_cfg));
             agent_started = false;
             ESP_LOGI(TAG, "Agent stopped");
