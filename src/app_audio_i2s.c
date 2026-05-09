@@ -9,6 +9,7 @@
 #include "app_codec_g711.h"
 #include "app_config.h"
 #include "app_audio_adv_codec.h"
+#include "app_audio_playback.h"
 #include "app_session.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
@@ -31,6 +32,7 @@
 
 #define APP_AUDIO_I2S_STACK_SIZE 6144
 #define APP_AUDIO_I2S_READ_TIMEOUT_MS 100
+#define APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS 1000U
 #define APP_AUDIO_I2S_PLL_D2_CLK 120000000U
 #define APP_AUDIO_I2S_OVERSAMPLING 2
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
@@ -43,7 +45,8 @@ typedef struct {
     TaskHandle_t task;
     i2s_chan_handle_t rx_handle;
     bool running;
-    uint32_t frame_count;
+    uint32_t processed_frame_count;
+    uint32_t sent_frame_count;
     uint32_t pts;
     uint8_t mode_index;
     uint8_t constant_frame_reports;
@@ -457,6 +460,7 @@ static void app_audio_i2s_task(void *arg)
     static int16_t stereo_frame_buffer[((APP_AUDIO_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000U) * 2U];
 #endif
     bool waiting_logged = false;
+    bool uplink_gated = false;
 
     (void)arg;
     memset(raw_frame_buffer, 0, sizeof(raw_frame_buffer));
@@ -569,6 +573,7 @@ static void app_audio_i2s_task(void *arg)
 #if APP_AUDIO_I2S_PROFILE_ENABLE
         frame_start_us = esp_timer_get_time();
 #endif
+        s_audio_i2s.processed_frame_count++;
 
         if (!app_session_is_audio_send_ready()) {
             if (!waiting_logged) {
@@ -579,56 +584,92 @@ static void app_audio_i2s_task(void *arg)
         }
         waiting_logged = false;
 
-        const void *frame_data = frame_buffer;
-        size_t frame_size = sample_count * sizeof(frame_buffer[0]);
-#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
-        uint8_t encoded_frame[samples_per_frame];
-        frame_size = app_codec_g711a_encode(frame_buffer, sample_count, encoded_frame, sizeof(encoded_frame));
-        frame_data = encoded_frame;
-#else
+        bool uplink_gated_this_frame = app_audio_playback_is_recently_active(APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS);
+        if (uplink_gated_this_frame) {
+            if (!uplink_gated) {
+                uplink_gated = true;
+                ESP_LOGI(TAG, "Remote audio active, muting mic uplink with silence frames");
+            }
+        } else if (uplink_gated) {
+            uplink_gated = false;
+            ESP_LOGI(TAG, "Remote audio inactive for %u ms, resuming live mic uplink",
+                     (unsigned)APP_AUDIO_I2S_UPLINK_GATE_HOLD_MS);
+        }
+
+        if (uplink_gated_this_frame) {
+            memset(frame_buffer, 0, sample_count * sizeof(frame_buffer[0]));
+        }
+
+        if (!s_audio_i2s.running) {
+            break;
+        }
+
         {
-            size_t stereo_sample_count = app_audio_i2s_expand_mono_to_stereo(frame_buffer, sample_count,
-                                                                              stereo_frame_buffer,
-                                                                              samples_per_frame * 2U);
-            if (stereo_sample_count == 0) {
-                ESP_LOGW(TAG, "Failed to expand Opus PCM frame to stereo");
+            const void *frame_data = frame_buffer;
+            size_t frame_size = sample_count * sizeof(frame_buffer[0]);
+#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
+            uint8_t encoded_frame[samples_per_frame];
+            frame_size = app_codec_g711a_encode(frame_buffer, sample_count, encoded_frame, sizeof(encoded_frame));
+            frame_data = encoded_frame;
+            if (frame_size != samples_per_frame) {
+                ESP_LOGE(TAG,
+                         "Unexpected G711A uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u gated=%d",
+                         (unsigned)frame_size,
+                         (unsigned)samples_per_frame,
+                         (unsigned)sample_count,
+                         (unsigned)bytes_read,
+                         uplink_gated ? 1 : 0);
                 continue;
             }
-            frame_data = stereo_frame_buffer;
-            frame_size = stereo_sample_count * sizeof(stereo_frame_buffer[0]);
-        }
+#else
+            {
+                size_t stereo_sample_count = app_audio_i2s_expand_mono_to_stereo(frame_buffer, sample_count,
+                                                                                  stereo_frame_buffer,
+                                                                                  samples_per_frame * 2U);
+                if (stereo_sample_count == 0) {
+                    ESP_LOGW(TAG, "Failed to expand Opus PCM frame to stereo");
+                    continue;
+                }
+                frame_data = stereo_frame_buffer;
+                frame_size = stereo_sample_count * sizeof(stereo_frame_buffer[0]);
+            }
 #endif
 
-        err = app_session_send_audio(frame_data, frame_size, s_audio_i2s.pts);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send mic audio frame: %s", esp_err_to_name(err));
+            err = app_session_send_audio(frame_data, frame_size, s_audio_i2s.pts);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to send mic audio frame: %s", esp_err_to_name(err));
 #if APP_AUDIO_I2S_PROFILE_ENABLE
-            s_audio_i2s.profile_send_failures++;
+                s_audio_i2s.profile_send_failures++;
 #endif
-            continue;
+                continue;
+            }
+
+            s_audio_i2s.sent_frame_count++;
+            s_audio_i2s.pts += samples_per_frame;
+#if APP_AUDIO_I2S_PROFILE_ENABLE
+            {
+                uint32_t frame_time_us = (uint32_t)(esp_timer_get_time() - frame_start_us);
+                uint32_t frame_budget_us = APP_AUDIO_FRAME_MS * 1000U;
+                s_audio_i2s.profile_window_frames++;
+                s_audio_i2s.profile_total_frame_time_us += frame_time_us;
+                if (frame_time_us > s_audio_i2s.profile_max_frame_time_us) {
+                    s_audio_i2s.profile_max_frame_time_us = frame_time_us;
+                }
+                if (frame_time_us > frame_budget_us) {
+                    s_audio_i2s.profile_deadline_misses++;
+                }
+            }
+#endif
         }
 
-        s_audio_i2s.frame_count++;
-        s_audio_i2s.pts += samples_per_frame;
-#if APP_AUDIO_I2S_PROFILE_ENABLE
-        {
-            uint32_t frame_time_us = (uint32_t)(esp_timer_get_time() - frame_start_us);
-            uint32_t frame_budget_us = APP_AUDIO_FRAME_MS * 1000U;
-            s_audio_i2s.profile_window_frames++;
-            s_audio_i2s.profile_total_frame_time_us += frame_time_us;
-            if (frame_time_us > s_audio_i2s.profile_max_frame_time_us) {
-                s_audio_i2s.profile_max_frame_time_us = frame_time_us;
-            }
-            if (frame_time_us > frame_budget_us) {
-                s_audio_i2s.profile_deadline_misses++;
-            }
-        }
-#endif
-        if ((s_audio_i2s.frame_count % (5000U / APP_AUDIO_FRAME_MS)) == 0U) {
+        if ((s_audio_i2s.processed_frame_count % (5000U / APP_AUDIO_FRAME_MS)) == 0U) {
             uint32_t raw_avg_abs = sample_count ? (uint32_t)(raw_abs_sum / (int64_t)sample_count) : 0U;
             uint32_t avg_abs = sample_count ? (uint32_t)(abs_sum / (int64_t)sample_count) : 0U;
-            ESP_LOGI(TAG, "Mic audio frames sent: %u (%u bytes last frame, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d)",
-                     (unsigned)s_audio_i2s.frame_count, (unsigned)bytes_read,
+            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u uplink_gated=%d (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d)",
+                     (unsigned)s_audio_i2s.processed_frame_count,
+                     (unsigned)s_audio_i2s.sent_frame_count,
+                     uplink_gated ? 1 : 0,
+                     (unsigned)bytes_read,
                      (unsigned)raw_avg_abs, (unsigned)raw_peak,
                      (unsigned)avg_abs, (unsigned)peak, (unsigned)zero_crossings, (int)first_sample,
                      APP_AUDIO_I2S_GAIN_NUM, APP_AUDIO_I2S_GAIN_DEN);
@@ -707,7 +748,8 @@ esp_err_t app_audio_i2s_start(void)
     }
 
     s_audio_i2s.running = true;
-    s_audio_i2s.frame_count = 0;
+    s_audio_i2s.processed_frame_count = 0;
+    s_audio_i2s.sent_frame_count = 0;
     s_audio_i2s.pts = 0;
 
     ESP_LOGI(TAG, "Free heap before mic task create: %u", (unsigned)esp_get_free_heap_size());
