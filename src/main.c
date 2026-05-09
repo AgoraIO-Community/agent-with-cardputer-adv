@@ -10,9 +10,6 @@
 #include "app_rtsa.h"
 #include "app_session.h"
 #include "app_time_sync.h"
-#include "app_webrtc.h"
-#include "app_webrtc_probe.h"
-#include "app_whip.h"
 #include "app_wifi.h"
 
 #include "esp_check.h"
@@ -70,72 +67,6 @@ static const char s_app_keyboard_map[4][14] = {
     { 0, 0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '\n' },
     { 0, 0, 0, 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', ' ' },
 };
-
-static bool app_main_has_placeholder(const char *value)
-{
-    return value == NULL || value[0] == '\0' || strcmp(value, "CHANGE_ME") == 0 || strstr(value, "CHANGE_ME") != NULL;
-}
-
-static bool app_main_has_whip_config(void)
-{
-    return !app_main_has_placeholder(APP_AGORA_WHIP_SERVER) &&
-           !app_main_has_placeholder(APP_AGORA_APP_ID) &&
-           !app_main_has_placeholder(APP_AGORA_APP_CERTIFICATE) &&
-           !app_main_has_placeholder(APP_AGORA_STREAM_ID) &&
-           !app_main_has_placeholder(APP_AGORA_UID);
-}
-
-static void app_main_run_whip_comparison_probe(void)
-{
-    app_webrtc_offer_t offer = { 0 };
-    app_whip_response_t whip = { 0 };
-    char *whip_url = NULL;
-    char *whip_token = NULL;
-    char *normalized_offer = NULL;
-    esp_err_t err;
-
-    if (!app_main_has_whip_config()) {
-        ESP_LOGW(TAG, "Skipping WHIP comparison: missing APP_AGORA_WHIP_SERVER / APP_AGORA_APP_ID / APP_AGORA_APP_CERTIFICATE / APP_AGORA_STREAM_ID / APP_AGORA_UID");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Running WHIP comparison probe");
-
-    err = app_webrtc_probe();
-    if (err == ESP_OK) {
-        err = app_whip_build_url(&whip_url);
-    }
-    if (err == ESP_OK) {
-        err = app_whip_generate_token(&whip_token);
-    }
-    if (err == ESP_OK) {
-        err = app_webrtc_create_audio_offer_for_role(APP_WEBRTC_SESSION_PUSH, &offer);
-    }
-    if (err == ESP_OK) {
-        err = app_whip_normalize_push_offer_sdp(offer.sdp_offer, &normalized_offer);
-    }
-    if (err == ESP_OK) {
-        err = app_whip_post_offer(whip_url, whip_token, normalized_offer, &whip);
-    }
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "WHIP comparison probe failed: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "WHIP comparison probe succeeded with status %d", whip.status_code);
-        if (whip.location != NULL) {
-            esp_err_t delete_err = app_whip_delete_session(whip.location, whip_token);
-            if (delete_err != ESP_OK) {
-                ESP_LOGW(TAG, "WHIP session cleanup failed: %s", esp_err_to_name(delete_err));
-            }
-        }
-    }
-
-    app_webrtc_destroy_offer(&offer);
-    app_whip_response_free(&whip);
-    free(normalized_offer);
-    free(whip_url);
-    free(whip_token);
-}
 
 static void app_main_on_pull_audio_info(app_session_audio_codec_t codec,
                                         uint32_t sample_rate,
@@ -453,9 +384,6 @@ void app_main(void)
     if (app_https_get_test(APP_HTTPS_TEST_URL) != ESP_OK) {
         ESP_LOGW(TAG, "HTTPS probe failed, continuing to protocol test");
     }
-#endif
-#if APP_COMPARE_WHIP_BEFORE_PROTOCOL
-    app_main_run_whip_comparison_probe();
 #endif
     err = app_protocol_get_config(&protocol_cfg);
     if (err != ESP_OK) {

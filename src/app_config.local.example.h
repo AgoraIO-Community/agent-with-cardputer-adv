@@ -5,13 +5,6 @@
 
 #define APP_PROTOCOL_BASE_URL "https://your-server.example.com"
 
-/* Optional: restore the old WHIP comparison path for side-by-side testing. */
-/* #define APP_AGORA_WHIP_SERVER "ap-webrtc-whip.ap.sd-rtn.com" */
-/* #define APP_AGORA_APP_ID "your-agora-app-id" */
-/* #define APP_AGORA_APP_CERTIFICATE "your-agora-app-certificate" */
-/* #define APP_AGORA_STREAM_ID "your-stream-id" */
-/* #define APP_AGORA_UID "10010" */
-
 /*
  * Latest known-feasible Cardputer RTSA setup without PSRAM:
  * - app-side G711A uplink encoding

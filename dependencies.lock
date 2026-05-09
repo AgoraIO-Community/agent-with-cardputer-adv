@@ -9,20 +9,12 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.5.9
-  espressif/esp_libsrtp:
-    component_hash: 131560184c73ec09f77d8904a2db709307803f0f9f111898921b6966776eac15
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.0.0
   idf:
     source:
       type: idf
     version: 6.0.0
 direct_dependencies:
 - espressif/esp_codec_dev
-- espressif/esp_libsrtp
-manifest_hash: ce51da05a2ebbc579d6536fa5ac98e8b68c589f4cabb20ecf49198c6a12abb4b
+manifest_hash: 556a70b49374b0d87870ef6ca0b45694d2fde5ca26bfddcd944ab1806630a310
 target: esp32s3
 version: 2.0.0

@@ -12,9 +12,6 @@ idf_component_register(
         ${CMAKE_SOURCE_DIR}/src/app_rtsa_compat.c
         ${CMAKE_SOURCE_DIR}/src/app_session.c
         ${CMAKE_SOURCE_DIR}/src/app_time_sync.c
-        ${CMAKE_SOURCE_DIR}/src/app_webrtc.c
-        ${CMAKE_SOURCE_DIR}/src/app_webrtc_probe.c
-        ${CMAKE_SOURCE_DIR}/src/app_whip.c
         ${CMAKE_SOURCE_DIR}/src/app_wifi.c
         ${CMAKE_SOURCE_DIR}/src/main.c
     INCLUDE_DIRS
