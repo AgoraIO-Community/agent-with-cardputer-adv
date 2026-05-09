@@ -60,11 +60,7 @@ static i2c_port_num_t app_audio_playback_i2c_port(void)
 
 static int app_audio_playback_i2s_port(void)
 {
-#if APP_AUDIO_USE_I2S_MIC
-    return APP_AUDIO_I2S_PORT;
-#else
     return APP_AUDIO_I2S_SPK_PORT;
-#endif
 }
 
 static esp_err_t app_audio_playback_write_pcm_locked(const int16_t *mono_pcm, size_t sample_count)
