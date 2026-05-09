@@ -7,6 +7,7 @@
 #include "app_audio_adv_codec.h"
 #include "app_audio_i2s.h"
 #include "app_codec_g711.h"
+#include "app_codec_g722.h"
 #include "app_config.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -435,6 +436,26 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
         }
         sample_count = app_codec_g711a_decode(data, size, decoded_pcm,
                                               sizeof(decoded_pcm) / sizeof(decoded_pcm[0]));
+    } else if (codec == APP_SESSION_AUDIO_CODEC_G722) {
+        const uint8_t *encoded = (const uint8_t *)data;
+
+        first_encoded = encoded[0];
+        for (size_t i = 1; i < size; i++) {
+            if (encoded[i] != first_encoded) {
+                all_same_encoded = false;
+                break;
+            }
+        }
+        if (s_playback.compressed_log_count < 6U) {
+            s_playback.compressed_log_count++;
+            ESP_LOGI(TAG, "Compressed playback frame[%u]: codec=g722 bytes=%u first=0x%02X all_same=%d",
+                     (unsigned)s_playback.compressed_log_count,
+                     (unsigned)size,
+                     (unsigned)first_encoded,
+                     all_same_encoded ? 1 : 0);
+        }
+        sample_count = app_codec_g722_decode(data, size, decoded_pcm,
+                                             sizeof(decoded_pcm) / sizeof(decoded_pcm[0]));
     } else {
         sample_count = size / sizeof(int16_t);
         if (sample_count > (sizeof(decoded_pcm) / sizeof(decoded_pcm[0]))) {

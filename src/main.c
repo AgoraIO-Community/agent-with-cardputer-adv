@@ -103,7 +103,7 @@ static esp_err_t app_validate_runtime_config(void)
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
         ESP_LOGI(TAG, "Audio path: Cardputer I2S mic + G711A @ %d Hz", APP_AUDIO_SAMPLE_RATE);
 #elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
-        ESP_LOGI(TAG, "Audio path: Cardputer I2S mic + G722/PCM input @ %d Hz", APP_AUDIO_SAMPLE_RATE);
+        ESP_LOGI(TAG, "Audio path: Cardputer I2S mic + G722 @ %d Hz", APP_AUDIO_SAMPLE_RATE);
 #else
         ESP_LOGI(TAG, "Audio path: Cardputer I2S mic + Opus @ %d Hz (capture @ %d Hz)",
                  APP_AUDIO_SAMPLE_RATE, APP_AUDIO_I2S_CAPTURE_RATE);

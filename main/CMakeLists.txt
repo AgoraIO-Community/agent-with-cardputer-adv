@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         ${CMAKE_SOURCE_DIR}/src/app_atomic_compat.c
         ${CMAKE_SOURCE_DIR}/src/app_codec_g711.c
+        ${CMAKE_SOURCE_DIR}/src/app_codec_g722.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_adv_codec.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_fake.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_i2s.c
@@ -12,6 +13,8 @@ idf_component_register(
         ${CMAKE_SOURCE_DIR}/src/app_rtsa_compat.c
         ${CMAKE_SOURCE_DIR}/src/app_session.c
         ${CMAKE_SOURCE_DIR}/src/app_time_sync.c
+        ${CMAKE_SOURCE_DIR}/src/app_vendor_g722_decode.c
+        ${CMAKE_SOURCE_DIR}/src/app_vendor_g722_encode.c
         ${CMAKE_SOURCE_DIR}/src/app_wifi.c
         ${CMAKE_SOURCE_DIR}/src/main.c
     INCLUDE_DIRS

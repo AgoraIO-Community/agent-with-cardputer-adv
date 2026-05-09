@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "app_codec_g711.h"
+#include "app_codec_g722.h"
 #include "app_config.h"
 #include "app_session.h"
 #include "esp_log.h"
@@ -59,6 +60,9 @@ static void app_audio_fake_task(void *arg)
         size_t frame_size = sizeof(pcm_frame);
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
         frame_size = app_codec_g711a_encode(pcm_frame, samples_per_frame, encoded_frame, sizeof(encoded_frame));
+        frame_data = encoded_frame;
+#elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
+        frame_size = app_codec_g722_encode(pcm_frame, samples_per_frame, encoded_frame, sizeof(encoded_frame));
         frame_data = encoded_frame;
 #endif
         esp_err_t err = app_session_send_audio(frame_data, frame_size, s_audio_fake.pts);

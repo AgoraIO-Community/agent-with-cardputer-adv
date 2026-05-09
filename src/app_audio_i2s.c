@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include "app_codec_g711.h"
+#include "app_codec_g722.h"
 #include "app_config.h"
 #include "app_audio_adv_codec.h"
 #include "app_audio_playback.h"
@@ -138,6 +139,7 @@ static uint8_t app_audio_i2s_initial_mode_index(void)
 #endif
 }
 
+#if !APP_AUDIO_I2S_USE_CARDPUTER_ADV
 static void app_audio_i2s_calc_clock_div(uint32_t *div_a, uint32_t *div_b, uint32_t *div_n,
                                          uint32_t base_clock, uint32_t target_freq)
 {
@@ -265,6 +267,7 @@ static void app_audio_i2s_apply_cardputer_pdm_clock(uint32_t sample_rate)
     (void)sample_rate;
 #endif
 }
+#endif
 
 static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t *mode)
 {
@@ -433,6 +436,7 @@ static size_t app_audio_i2s_resample_frame(const int16_t *input,
     return 0;
 }
 
+#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
 static size_t app_audio_i2s_expand_mono_to_stereo(const int16_t *input,
                                                   size_t input_count,
                                                   int16_t *output,
@@ -448,6 +452,7 @@ static size_t app_audio_i2s_expand_mono_to_stereo(const int16_t *input,
     }
     return input_count * 2U;
 }
+#endif
 
 static void app_audio_i2s_task(void *arg)
 {
@@ -456,7 +461,7 @@ static void app_audio_i2s_task(void *arg)
     static int16_t raw_frame_buffer[APP_AUDIO_I2S_READ_SAMPLES_PER_FRAME];
     static int16_t capture_frame_buffer[(APP_AUDIO_I2S_CAPTURE_RATE * APP_AUDIO_FRAME_MS) / 1000U];
     static int16_t frame_buffer[(APP_AUDIO_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000U];
-#if APP_AUDIO_CODEC != APP_AUDIO_CODEC_G711A
+#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
     static int16_t stereo_frame_buffer[((APP_AUDIO_SAMPLE_RATE * APP_AUDIO_FRAME_MS) / 1000U) * 2U];
 #endif
     bool waiting_logged = false;
@@ -466,7 +471,7 @@ static void app_audio_i2s_task(void *arg)
     memset(raw_frame_buffer, 0, sizeof(raw_frame_buffer));
     memset(capture_frame_buffer, 0, sizeof(capture_frame_buffer));
     memset(frame_buffer, 0, sizeof(frame_buffer));
-#if APP_AUDIO_CODEC != APP_AUDIO_CODEC_G711A
+#if APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
     memset(stereo_frame_buffer, 0, sizeof(stereo_frame_buffer));
 #endif
 
@@ -621,7 +626,21 @@ static void app_audio_i2s_task(void *arg)
                          uplink_gated ? 1 : 0);
                 continue;
             }
-#else
+#elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
+            uint8_t encoded_frame[samples_per_frame];
+            frame_size = app_codec_g722_encode(frame_buffer, sample_count, encoded_frame, sizeof(encoded_frame));
+            frame_data = encoded_frame;
+            if (frame_size != (sample_count / 2U)) {
+                ESP_LOGE(TAG,
+                         "Unexpected G722 uplink frame size: encoded=%u expected=%u sample_count=%u bytes_read=%u gated=%d",
+                         (unsigned)frame_size,
+                         (unsigned)(sample_count / 2U),
+                         (unsigned)sample_count,
+                         (unsigned)bytes_read,
+                         uplink_gated ? 1 : 0);
+                continue;
+            }
+#elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_OPUS
             {
                 size_t stereo_sample_count = app_audio_i2s_expand_mono_to_stereo(frame_buffer, sample_count,
                                                                                   stereo_frame_buffer,

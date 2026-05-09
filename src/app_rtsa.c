@@ -31,24 +31,10 @@ static audio_codec_type_e app_rtsa_audio_codec_type(void)
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
     return AUDIO_CODEC_DISABLED;
 #elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
-    return AUDIO_CODEC_TYPE_G722;
+    return AUDIO_CODEC_DISABLED;
 #else
     return AUDIO_CODEC_TYPE_OPUS;
 #endif
-}
-
-static audio_data_type_e app_rtsa_rx_type_from_name(void)
-{
-    if (strcmp(APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC, "g722") == 0) {
-        return AUDIO_DATA_TYPE_G722;
-    }
-    if (strcmp(APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC, "g711a") == 0 || strcmp(APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC, "pcma") == 0) {
-        return AUDIO_DATA_TYPE_PCMA;
-    }
-    if (strcmp(APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC, "opus") == 0) {
-        return AUDIO_DATA_TYPE_OPUS;
-    }
-    return AUDIO_DATA_TYPE_G722;
 }
 
 static app_session_audio_codec_t app_rtsa_map_codec(audio_data_type_e data_type)
@@ -269,7 +255,9 @@ esp_err_t app_rtsa_start(const app_protocol_config_t *config)
     channel_options.audio_codec_opt.pcm_duration = APP_AUDIO_FRAME_MS;
 
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
-    ESP_LOGI(TAG, "RTSA audio codec mode: external G711A encode, SDK codec disabled");
+    ESP_LOGI(TAG, "RTSA audio codec mode: external G711A encode/decode path, SDK codec disabled");
+#elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
+    ESP_LOGI(TAG, "RTSA audio codec mode: external G722 encode/decode path, SDK codec disabled");
 #else
     ESP_LOGI(TAG, "RTSA audio codec mode: SDK encoder=%d", (int)channel_options.audio_codec_opt.audio_codec_type);
 #endif
@@ -308,7 +296,7 @@ esp_err_t app_rtsa_send_audio(const void *data, size_t size, uint32_t pts)
 #if APP_AUDIO_CODEC == APP_AUDIO_CODEC_G711A
     info.data_type = AUDIO_DATA_TYPE_PCMA;
 #elif APP_AUDIO_CODEC == APP_AUDIO_CODEC_G722
-    info.data_type = AUDIO_DATA_TYPE_PCM;
+    info.data_type = AUDIO_DATA_TYPE_G722;
 #else
     info.data_type = AUDIO_DATA_TYPE_PCM;
 #endif
