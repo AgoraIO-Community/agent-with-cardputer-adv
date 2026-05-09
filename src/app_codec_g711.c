@@ -33,6 +33,29 @@ static uint8_t app_codec_g711a_from_pcm(int16_t pcm)
     return (uint8_t)(aval ^ mask);
 }
 
+static int16_t app_codec_g711a_to_pcm(uint8_t aval)
+{
+    aval ^= 0x55U;
+
+    int16_t t = (int16_t)((aval & 0x0FU) << 4);
+    int16_t seg = (int16_t)((aval & 0x70U) >> 4);
+
+    switch (seg) {
+    case 0:
+        t += 8;
+        break;
+    case 1:
+        t += 0x108;
+        break;
+    default:
+        t += 0x108;
+        t <<= (seg - 1);
+        break;
+    }
+
+    return (aval & 0x80U) ? t : (int16_t)(-t);
+}
+
 size_t app_codec_g711a_encode(const int16_t *pcm, size_t sample_count, uint8_t *out, size_t out_size)
 {
     size_t encoded = sample_count < out_size ? sample_count : out_size;
@@ -45,4 +68,18 @@ size_t app_codec_g711a_encode(const int16_t *pcm, size_t sample_count, uint8_t *
         out[i] = app_codec_g711a_from_pcm(pcm[i]);
     }
     return encoded;
+}
+
+size_t app_codec_g711a_decode(const uint8_t *encoded, size_t encoded_size, int16_t *out, size_t out_capacity)
+{
+    size_t decoded = encoded_size < out_capacity ? encoded_size : out_capacity;
+
+    if (encoded == NULL || out == NULL) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < decoded; i++) {
+        out[i] = app_codec_g711a_to_pcm(encoded[i]);
+    }
+    return decoded;
 }

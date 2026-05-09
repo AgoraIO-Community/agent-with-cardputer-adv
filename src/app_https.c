@@ -59,6 +59,12 @@ esp_err_t app_https_get_test(const char *url)
 
     err = esp_http_client_perform(client);
     if (err != ESP_OK) {
+        int tls_code = 0;
+        int tls_flags = 0;
+        if (esp_http_client_get_and_clear_last_tls_error(client, &tls_code, &tls_flags) == ESP_OK &&
+            (tls_code != 0 || tls_flags != 0)) {
+            ESP_LOGE(TAG, "HTTPS TLS error: esp_tls_code=0x%x tls_flags=0x%x", tls_code, tls_flags);
+        }
         ESP_LOGE(TAG, "HTTPS GET failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return err;

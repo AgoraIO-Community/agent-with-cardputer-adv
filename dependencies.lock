@@ -1,4 +1,14 @@
 dependencies:
+  espressif/esp_codec_dev:
+    component_hash: 9293329ccb361f67c6e847ab8f693b2d9158b2e438eff583c28558c29cdf3dca
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.5.9
   espressif/esp_libsrtp:
     component_hash: 131560184c73ec09f77d8904a2db709307803f0f9f111898921b6966776eac15
     dependencies: []
@@ -11,7 +21,8 @@ dependencies:
       type: idf
     version: 6.0.0
 direct_dependencies:
+- espressif/esp_codec_dev
 - espressif/esp_libsrtp
-manifest_hash: a74dccdf507fe6b9adf38550f349d793bd590937bf4e36277d5f0a46e3067181
+manifest_hash: ce51da05a2ebbc579d6536fa5ac98e8b68c589f4cabb20ecf49198c6a12abb4b
 target: esp32s3
 version: 2.0.0

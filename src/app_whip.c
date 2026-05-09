@@ -62,6 +62,48 @@ static const char *app_whip_audio_codec_attrs(void)
 #endif
 }
 
+static const char *app_whip_pull_audio_rtpmap(void)
+{
+    return "a=rtpmap:8 PCMA/8000";
+}
+
+static const char *app_whip_pull_audio_mline(void)
+{
+    return "m=audio 9 UDP/TLS/RTP/SAVPF 8";
+}
+
+static esp_err_t app_whip_extract_line_with_prefix(const char *input_sdp, const char *prefix, char **out_line);
+static esp_err_t app_whip_dup_string(char **dst, const char *src, size_t len);
+static esp_err_t app_whip_format_alloc(char **out, const char *fmt, ...);
+
+static esp_err_t app_whip_build_pull_answer_mline(const char *input_sdp, char **out_line)
+{
+    char *input_mline = NULL;
+    esp_err_t ret;
+
+    if (input_sdp == NULL || out_line == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = app_whip_extract_line_with_prefix(input_sdp, "m=audio ", &input_mline);
+    if (ret != ESP_OK) {
+        return app_whip_dup_string(out_line, "m=audio 4702 RTP/SAVPF 8", strlen("m=audio 4702 RTP/SAVPF 8"));
+    }
+
+    if (strstr(input_mline, "RTP/SAVPF") != NULL && strstr(input_mline, " 8") == NULL) {
+        ret = app_whip_format_alloc(out_line, "%s 8", input_mline);
+    } else {
+        ret = app_whip_dup_string(out_line, input_mline, strlen(input_mline));
+    }
+
+    free(input_mline);
+    return ret;
+}
+
+static esp_err_t app_whip_normalize_offer_sdp_for_direction(const char *input_sdp, const char *direction, char **out_sdp);
+static esp_err_t app_whip_normalize_answer_sdp_for_direction(const char *input_sdp, const char *direction, char **out_sdp);
+static esp_err_t app_whip_normalize_pull_answer_passthrough(const char *input_sdp, char **out_sdp);
+
 static bool app_whip_has_placeholder(const char *value)
 {
     return value == NULL || value[0] == '\0' || strcmp(value, "CHANGE_ME") == 0;
@@ -191,6 +233,18 @@ esp_err_t app_whip_build_url(char **out_url)
                                  APP_AGORA_UID);
 }
 
+esp_err_t app_whip_build_pull_url(char **out_url)
+{
+    if (out_url == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (app_whip_has_placeholder(APP_AGORA_WHIP_SERVER) || app_whip_has_placeholder(APP_AGORA_STREAM_ID) ||
+        app_whip_has_placeholder(APP_AGORA_REMOTE_PULL_UID)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return app_whip_format_alloc(out_url, "https://%s/pull/%s", APP_AGORA_WHIP_SERVER, APP_AGORA_STREAM_ID);
+}
+
 esp_err_t app_whip_generate_token(char **out_token)
 {
     static const char *header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
@@ -317,7 +371,123 @@ cleanup:
     return ret;
 }
 
-esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
+esp_err_t app_whip_generate_pull_token(char **out_token)
+{
+    static const char *header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    char *header_b64 = NULL;
+    char *payload_json = NULL;
+    char *payload_b64 = NULL;
+    char *signing_input = NULL;
+    char *signature_b64 = NULL;
+    unsigned char signature[32];
+    const mbedtls_md_info_t *md_info;
+    unsigned char key_block[64];
+    unsigned char inner_digest[32];
+    unsigned char ipad[64];
+    unsigned char opad[64];
+    size_t cert_len;
+    long long exp_unix;
+    esp_err_t ret;
+
+    if (out_token == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (app_whip_has_placeholder(APP_AGORA_APP_ID) || app_whip_has_placeholder(APP_AGORA_APP_CERTIFICATE) ||
+        app_whip_has_placeholder(APP_AGORA_STREAM_ID)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ret = app_whip_base64url_encode((const unsigned char *)header_json, strlen(header_json), &header_b64);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to encode pull JWT header");
+
+    exp_unix = (long long)(time(NULL) + APP_AGORA_WHIP_TOKEN_TTL_SEC);
+    ret = app_whip_format_alloc(&payload_json,
+                                "{\"version\":\"1.0\","
+                                "\"appId\":\"%s\","
+                                "\"appID\":\"%s\","
+                                "\"streamId\":\"%s\","
+                                "\"streamID\":\"%s\","
+                                "\"exp\":%lld,"
+                                "\"action\":\"pull\"}",
+                                APP_AGORA_APP_ID, APP_AGORA_APP_ID,
+                                APP_AGORA_STREAM_ID, APP_AGORA_STREAM_ID,
+                                exp_unix);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to build pull JWT payload");
+    ESP_LOGI(TAG, "Pull JWT payload summary: appId=<masked> streamId=%s exp=%lld uid=<omitted>",
+             APP_AGORA_STREAM_ID, exp_unix);
+
+    ret = app_whip_base64url_encode((const unsigned char *)payload_json, strlen(payload_json), &payload_b64);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to encode pull JWT payload");
+
+    ret = app_whip_format_alloc(&signing_input, "%s.%s", header_b64, payload_b64);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to build pull JWT signing input");
+
+    md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md_info == NULL) {
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+    memset(key_block, 0, sizeof(key_block));
+    cert_len = strlen(APP_AGORA_APP_CERTIFICATE);
+    if (cert_len > sizeof(key_block)) {
+        if (mbedtls_md(md_info, (const unsigned char *)APP_AGORA_APP_CERTIFICATE, cert_len, key_block) != 0) {
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+    } else {
+        memcpy(key_block, APP_AGORA_APP_CERTIFICATE, cert_len);
+    }
+    for (size_t i = 0; i < sizeof(key_block); i++) {
+        ipad[i] = (unsigned char)(key_block[i] ^ 0x36U);
+        opad[i] = (unsigned char)(key_block[i] ^ 0x5cU);
+    }
+
+    {
+        unsigned char *inner_input = NULL;
+        size_t inner_input_len = sizeof(ipad) + strlen(signing_input);
+
+        inner_input = calloc(1, inner_input_len);
+        if (inner_input == NULL) {
+            ret = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        memcpy(inner_input, ipad, sizeof(ipad));
+        memcpy(inner_input + sizeof(ipad), signing_input, strlen(signing_input));
+        if (mbedtls_md(md_info, inner_input, inner_input_len, inner_digest) != 0) {
+            free(inner_input);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+        free(inner_input);
+    }
+
+    {
+        unsigned char outer_input[sizeof(opad) + sizeof(inner_digest)];
+
+        memcpy(outer_input, opad, sizeof(opad));
+        memcpy(outer_input + sizeof(opad), inner_digest, sizeof(inner_digest));
+        if (mbedtls_md(md_info, outer_input, sizeof(outer_input), signature) != 0) {
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+    }
+
+    ret = app_whip_base64url_encode(signature, sizeof(signature), &signature_b64);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to encode pull JWT signature");
+
+    ret = app_whip_format_alloc(out_token, "%s.%s", signing_input, signature_b64);
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Failed to build pull JWT token");
+
+cleanup:
+    free(header_b64);
+    free(payload_json);
+    free(payload_b64);
+    free(signing_input);
+    free(signature_b64);
+    return ret;
+}
+
+static esp_err_t app_whip_normalize_offer_sdp_for_direction(const char *input_sdp, const char *direction, char **out_sdp)
 {
     const char *cursor;
     char *normalized = NULL;
@@ -326,6 +496,7 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
     bool sendonly_emitted = false;
     bool audio_rtpmap_emitted = false;
     bool audio_codec_attrs_emitted = false;
+    bool pull_offer = strcmp(direction, "a=recvonly") == 0;
 
     if (input_sdp == NULL || out_sdp == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -343,7 +514,7 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
 
         if (line_len >= strlen("m=audio 9 UDP/TLS/RTP/SAVP") &&
             strncmp(line, "m=audio 9 UDP/TLS/RTP/SAVP", strlen("m=audio 9 UDP/TLS/RTP/SAVP")) == 0) {
-            line = app_whip_audio_mline();
+            line = pull_offer ? app_whip_pull_audio_mline() : app_whip_audio_mline();
             line_len = strlen(line);
         } else if (line_len >= strlen("a=rtpmap:111 ") &&
                    strncmp(line, "a=rtpmap:111 ", strlen("a=rtpmap:111 ")) == 0) {
@@ -351,9 +522,14 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
                 cursor = line_end ? line_end + 1 : cursor + line_len;
                 continue;
             }
-            line = app_whip_audio_rtpmap();
+            line = pull_offer ? app_whip_pull_audio_rtpmap() : app_whip_audio_rtpmap();
             line_len = strlen(line);
             audio_rtpmap_emitted = true;
+        } else if (pull_offer &&
+                   ((line_len >= strlen("a=ssrc:") && strncmp(line, "a=ssrc:", strlen("a=ssrc:")) == 0) ||
+                    (line_len >= strlen("a=msid:") && strncmp(line, "a=msid:", strlen("a=msid:")) == 0))) {
+            cursor = line_end ? line_end + 1 : cursor + line_len;
+            continue;
         } else if (line_len >= strlen("a=fmtp:111 ") &&
                    strncmp(line, "a=fmtp:111 ", strlen("a=fmtp:111 ")) == 0) {
             cursor = line_end ? line_end + 1 : cursor + line_len;
@@ -369,13 +545,20 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
         } else if ((line_len == strlen("a=sendrecv") && strncmp(line, "a=sendrecv", line_len) == 0) ||
                    (line_len == strlen("a=recvonly") && strncmp(line, "a=recvonly", line_len) == 0) ||
                    (line_len == strlen("a=inactive") && strncmp(line, "a=inactive", line_len) == 0)) {
-            cursor = line_end ? line_end + 1 : cursor + line_len;
-            continue;
+            if (sendonly_emitted) {
+                cursor = line_end ? line_end + 1 : cursor + line_len;
+                continue;
+            }
+            line = direction;
+            line_len = strlen(line);
+            sendonly_emitted = true;
         } else if (line_len == strlen("a=sendonly") && strncmp(line, "a=sendonly", line_len) == 0) {
             if (sendonly_emitted) {
                 cursor = line_end ? line_end + 1 : cursor + line_len;
                 continue;
             }
+            line = direction;
+            line_len = strlen(line);
             sendonly_emitted = true;
         }
 
@@ -394,7 +577,8 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
         length += line_len;
         normalized[length++] = '\n';
 
-        if (audio_rtpmap_emitted && !audio_codec_attrs_emitted && app_whip_audio_codec_attrs() != NULL &&
+        if (!pull_offer &&
+            audio_rtpmap_emitted && !audio_codec_attrs_emitted && app_whip_audio_codec_attrs() != NULL &&
             strcmp(line, app_whip_audio_rtpmap()) == 0) {
             const char *attrs = app_whip_audio_codec_attrs();
             size_t attrs_len = strlen(attrs);
@@ -428,6 +612,16 @@ esp_err_t app_whip_normalize_offer_sdp(const char *input_sdp, char **out_sdp)
     normalized[length] = '\0';
     *out_sdp = normalized;
     return ESP_OK;
+}
+
+esp_err_t app_whip_normalize_push_offer_sdp(const char *input_sdp, char **out_sdp)
+{
+    return app_whip_normalize_offer_sdp_for_direction(input_sdp, "a=sendonly", out_sdp);
+}
+
+esp_err_t app_whip_normalize_pull_offer_sdp(const char *input_sdp, char **out_sdp)
+{
+    return app_whip_normalize_offer_sdp_for_direction(input_sdp, "a=recvonly", out_sdp);
 }
 
 static esp_err_t app_whip_sdp_append(char **buffer, size_t *capacity, size_t *length,
@@ -477,6 +671,59 @@ static esp_err_t app_whip_extract_line_value(const char *input_sdp, const char *
     return app_whip_dup_string(out_value, start, len);
 }
 
+static esp_err_t app_whip_extract_line_with_prefix(const char *input_sdp, const char *prefix, char **out_line)
+{
+    const char *start;
+    const char *end;
+    size_t len;
+
+    if (input_sdp == NULL || prefix == NULL || out_line == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    start = strstr(input_sdp, prefix);
+    if (start == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    end = strpbrk(start, "\r\n");
+    len = end ? (size_t)(end - start) : strlen(start);
+    return app_whip_dup_string(out_line, start, len);
+}
+
+static esp_err_t app_whip_append_lines_with_prefix(const char *input_sdp,
+                                                   const char *prefix,
+                                                   char **buffer,
+                                                   size_t *capacity,
+                                                   size_t *length)
+{
+    const char *cursor;
+    size_t prefix_len;
+    esp_err_t ret = ESP_OK;
+
+    if (input_sdp == NULL || prefix == NULL || buffer == NULL || capacity == NULL || length == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cursor = input_sdp;
+    prefix_len = strlen(prefix);
+    while (*cursor != '\0') {
+        const char *line_end = strstr(cursor, "\n");
+        size_t line_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+
+        if (line_len > 0 && cursor[line_len - 1] == '\r') {
+            line_len--;
+        }
+        if (line_len >= prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
+            ret = app_whip_sdp_append(buffer, capacity, length, cursor, line_len);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
+        cursor = line_end ? line_end + 1 : cursor + line_len;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t app_whip_normalize_candidate_value(const char *candidate_value, char **out_candidate)
 {
     char foundation[64];
@@ -502,19 +749,26 @@ static esp_err_t app_whip_normalize_candidate_value(const char *candidate_value,
                                  component, priority, ip, port, cand_type);
 }
 
-esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
+static esp_err_t app_whip_normalize_answer_sdp_for_direction(const char *input_sdp, const char *direction, char **out_sdp)
 {
     char *normalized = NULL;
     size_t capacity = 0;
     size_t length = 0;
     char *group_bundle = NULL;
+    char *msid_semantic = NULL;
+    char *remote_media_msid = NULL;
     char *ice_ufrag = NULL;
     char *ice_pwd = NULL;
     char *fingerprint = NULL;
     char *candidate1 = NULL;
     char *candidate2 = NULL;
     char *normalized_candidate1 = NULL;
+    char *pull_mline = NULL;
+    char *rtcp_line = NULL;
+    char *extmap_line = NULL;
+    char *maxptime_line = NULL;
     esp_err_t ret;
+    bool pull_answer = strcmp(direction, "a=sendonly") == 0;
 
     if (input_sdp == NULL || out_sdp == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -527,12 +781,17 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
     if (ret != ESP_OK) {
         goto cleanup;
     }
+    (void)app_whip_extract_line_value(input_sdp, "a=msid-semantic: ", &msid_semantic);
+    (void)app_whip_extract_line_value(input_sdp, "a=msid:", &remote_media_msid);
     ESP_GOTO_ON_ERROR(app_whip_extract_line_value(input_sdp, "a=ice-ufrag:", &ice_ufrag), cleanup, TAG,
                       "Missing WHIP answer ice-ufrag");
     ESP_GOTO_ON_ERROR(app_whip_extract_line_value(input_sdp, "a=ice-pwd:", &ice_pwd), cleanup, TAG,
                       "Missing WHIP answer ice-pwd");
     ESP_GOTO_ON_ERROR(app_whip_extract_line_value(input_sdp, "a=fingerprint:sha-256 ", &fingerprint), cleanup, TAG,
                       "Missing WHIP answer fingerprint");
+    (void)app_whip_extract_line_with_prefix(input_sdp, "a=rtcp:", &rtcp_line);
+    (void)app_whip_extract_line_with_prefix(input_sdp, "a=extmap:", &extmap_line);
+    (void)app_whip_extract_line_with_prefix(input_sdp, "a=maxptime:", &maxptime_line);
 
     (void)app_whip_extract_line_value(input_sdp, "a=candidate:", &candidate1);
     if (candidate1 != NULL) {
@@ -545,7 +804,6 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
         ESP_GOTO_ON_ERROR(app_whip_normalize_candidate_value(candidate1, &normalized_candidate1), cleanup, TAG,
                           "Failed to normalize WHIP candidate");
     }
-
     ret = app_whip_sdp_append(&normalized, &capacity, &length, "v=0", strlen("v=0"));
     if (ret != ESP_OK) {
         goto cleanup;
@@ -575,15 +833,45 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
             goto cleanup;
         }
     }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=msid-semantic: esp-webrtc",
-                              strlen("a=msid-semantic: esp-webrtc"));
-    if (ret != ESP_OK) {
-        goto cleanup;
+    if (pull_answer) {
+        if (msid_semantic != NULL) {
+            char *line = NULL;
+            ret = app_whip_format_alloc(&line, "a=msid-semantic: %s", msid_semantic);
+            if (ret != ESP_OK) {
+                goto cleanup;
+            }
+            ret = app_whip_sdp_append(&normalized, &capacity, &length, line, strlen(line));
+            free(line);
+            if (ret != ESP_OK) {
+                goto cleanup;
+            }
+        }
+    } else {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=msid-semantic: esp-webrtc",
+                                  strlen("a=msid-semantic: esp-webrtc"));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
     }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length,
-                              app_whip_audio_mline(), strlen(app_whip_audio_mline()));
-    if (ret != ESP_OK) {
-        goto cleanup;
+    if (pull_answer) {
+        ESP_GOTO_ON_ERROR(app_whip_build_pull_answer_mline(input_sdp, &pull_mline), cleanup, TAG,
+                          "Failed to build pull-answer m-line");
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, pull_mline, strlen(pull_mline));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+    } else {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length,
+                                  app_whip_audio_mline(), strlen(app_whip_audio_mline()));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+    }
+    if (pull_answer && rtcp_line != NULL) {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, rtcp_line, strlen(rtcp_line));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
     }
     ret = app_whip_sdp_append(&normalized, &capacity, &length,
                               app_whip_audio_rtpmap(), strlen(app_whip_audio_rtpmap()));
@@ -597,24 +885,46 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
             goto cleanup;
         }
     }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length,
-                              app_whip_audio_cname(), strlen(app_whip_audio_cname()));
-    if (ret != ESP_OK) {
-        goto cleanup;
-    }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=ssrc:6 msid:esp_stream a0",
-                              strlen("a=ssrc:6 msid:esp_stream a0"));
-    if (ret != ESP_OK) {
-        goto cleanup;
+    if (pull_answer) {
+        ret = app_whip_append_lines_with_prefix(input_sdp, "a=ssrc:", &normalized, &capacity, &length);
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+    } else {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length,
+                                  app_whip_audio_cname(), strlen(app_whip_audio_cname()));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=ssrc:6 msid:esp_stream a0",
+                                  strlen("a=ssrc:6 msid:esp_stream a0"));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
     }
     ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=mid:0", strlen("a=mid:0"));
     if (ret != ESP_OK) {
         goto cleanup;
     }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=msid:esp_stream a0",
-                              strlen("a=msid:esp_stream a0"));
-    if (ret != ESP_OK) {
-        goto cleanup;
+    if (pull_answer) {
+        if (remote_media_msid != NULL) {
+            char *line = NULL;
+            ret = app_whip_format_alloc(&line, "a=msid:%s", remote_media_msid);
+            if (ret != ESP_OK) {
+                goto cleanup;
+            }
+            ret = app_whip_sdp_append(&normalized, &capacity, &length, line, strlen(line));
+            free(line);
+            if (ret != ESP_OK) {
+                goto cleanup;
+            }
+        }
+    } else {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=msid:esp_stream a0",
+                                  strlen("a=msid:esp_stream a0"));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
     }
     ret = app_whip_sdp_append(&normalized, &capacity, &length, "c=IN IP4 0.0.0.0",
                               strlen("c=IN IP4 0.0.0.0"));
@@ -625,7 +935,19 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
     if (ret != ESP_OK) {
         goto cleanup;
     }
-    ret = app_whip_sdp_append(&normalized, &capacity, &length, "a=recvonly", strlen("a=recvonly"));
+    if (pull_answer && extmap_line != NULL) {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, extmap_line, strlen(extmap_line));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+    }
+    if (pull_answer && maxptime_line != NULL) {
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, maxptime_line, strlen(maxptime_line));
+        if (ret != ESP_OK) {
+            goto cleanup;
+        }
+    }
+    ret = app_whip_sdp_append(&normalized, &capacity, &length, direction, strlen(direction));
     if (ret != ESP_OK) {
         goto cleanup;
     }
@@ -690,13 +1012,93 @@ esp_err_t app_whip_normalize_answer_sdp(const char *input_sdp, char **out_sdp)
 cleanup:
     free(normalized);
     free(group_bundle);
+    free(msid_semantic);
+    free(remote_media_msid);
     free(ice_ufrag);
     free(ice_pwd);
     free(fingerprint);
     free(candidate1);
     free(candidate2);
     free(normalized_candidate1);
+    free(pull_mline);
+    free(rtcp_line);
+    free(extmap_line);
+    free(maxptime_line);
     return ret;
+}
+
+static esp_err_t app_whip_normalize_pull_answer_passthrough(const char *input_sdp, char **out_sdp)
+{
+    const char *cursor;
+    char *normalized = NULL;
+    size_t capacity = 0;
+    size_t length = 0;
+    bool has_rtpmap = false;
+    bool inserted_rtpmap = false;
+    esp_err_t ret;
+
+    if (input_sdp == NULL || out_sdp == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strstr(input_sdp, "a=rtpmap:8 PCMA/8000") != NULL) {
+        has_rtpmap = true;
+    }
+
+    cursor = input_sdp;
+    while (*cursor != '\0') {
+        const char *line_end = strstr(cursor, "\n");
+        size_t line_len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
+        const char *line = cursor;
+
+        if (line_len > 0 && line[line_len - 1] == '\r') {
+            line_len--;
+        }
+
+        if (line_len == 0) {
+            cursor = line_end ? line_end + 1 : cursor + line_len;
+            continue;
+        }
+
+        ret = app_whip_sdp_append(&normalized, &capacity, &length, line, line_len);
+        if (ret != ESP_OK) {
+            free(normalized);
+            return ret;
+        }
+
+        if (!has_rtpmap &&
+            line_len >= strlen("m=audio ") &&
+            strncmp(line, "m=audio ", strlen("m=audio ")) == 0 &&
+            strstr(line, " 8") != NULL &&
+            !inserted_rtpmap) {
+            ret = app_whip_sdp_append(&normalized, &capacity, &length,
+                                      "a=rtpmap:8 PCMA/8000", strlen("a=rtpmap:8 PCMA/8000"));
+            if (ret != ESP_OK) {
+                free(normalized);
+                return ret;
+            }
+            inserted_rtpmap = true;
+        }
+
+        cursor = line_end ? line_end + 1 : cursor + line_len;
+    }
+
+    if (normalized == NULL) {
+        return ESP_FAIL;
+    }
+    normalized[length] = '\0';
+    *out_sdp = normalized;
+    return ESP_OK;
+}
+
+esp_err_t app_whip_normalize_push_answer_sdp(const char *input_sdp, char **out_sdp)
+{
+    return app_whip_normalize_answer_sdp_for_direction(input_sdp, "a=recvonly", out_sdp);
+}
+
+esp_err_t app_whip_normalize_pull_answer_sdp(const char *input_sdp, char **out_sdp)
+{
+    return app_whip_normalize_pull_answer_passthrough(input_sdp, out_sdp);
 }
 
 static esp_err_t app_whip_append_body(app_whip_http_ctx_t *ctx, const char *data, int len)
@@ -882,6 +1284,7 @@ esp_err_t app_whip_post_offer(const char *whip_url,
     }
     return ESP_OK;
 }
+
 
 esp_err_t app_whip_delete_session(const char *location, const char *bearer_token)
 {

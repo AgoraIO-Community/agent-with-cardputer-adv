@@ -8,11 +8,12 @@
 
 #include "app_codec_g711.h"
 #include "app_config.h"
-#include "app_webrtc.h"
-#include "driver/i2c_master.h"
+#include "app_audio_adv_codec.h"
+#include "app_session.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -41,8 +42,6 @@
 typedef struct {
     TaskHandle_t task;
     i2s_chan_handle_t rx_handle;
-    i2c_master_bus_handle_t i2c_bus;
-    i2c_master_dev_handle_t i2c_dev;
     bool running;
     uint32_t frame_count;
     uint32_t pts;
@@ -61,7 +60,6 @@ typedef struct {
 
 static const char *TAG = "app_audio_i2s";
 static app_audio_i2s_ctx_t s_audio_i2s;
-static const uint8_t APP_AUDIO_I2S_ADV_ES8311_ADDR = 0x18;
 
 typedef struct {
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
@@ -78,10 +76,10 @@ typedef struct {
 static const app_audio_i2s_mode_t s_audio_i2s_modes[] = {
     { false, false, false, "right ws_inv=0 bclk_inv=0" },
     { true,  false, false, "left ws_inv=0 bclk_inv=0" },
-    { false, true,  false, "right ws_inv=0 bclk_inv=1" },
-    { true,  true,  false, "left ws_inv=0 bclk_inv=1" },
-    { false, false, true,  "right ws_inv=1 bclk_inv=0" },
-    { true,  false, true,  "left ws_inv=1 bclk_inv=0" },
+    { false, true,  false, "right ws_inv=1 bclk_inv=0" },
+    { true,  true,  false, "left ws_inv=1 bclk_inv=0" },
+    { false, false, true,  "right ws_inv=0 bclk_inv=1" },
+    { true,  false, true,  "left ws_inv=0 bclk_inv=1" },
     { false, true,  true,  "right ws_inv=1 bclk_inv=1" },
     { true,  true,  true,  "left ws_inv=1 bclk_inv=1" },
 };
@@ -135,81 +133,6 @@ static uint8_t app_audio_i2s_initial_mode_index(void)
     }
     return 0;
 #endif
-}
-
-static esp_err_t app_audio_i2s_adv_codec_write_bulk(const uint8_t *bulk_data)
-{
-    while (*bulk_data != 0) {
-        uint8_t len = *bulk_data++;
-        ESP_RETURN_ON_FALSE(len >= 2, ESP_ERR_INVALID_ARG, TAG, "Invalid codec bulk write length");
-        ESP_RETURN_ON_ERROR(i2c_master_transmit(
-                                s_audio_i2s.i2c_dev,
-                                bulk_data,
-                                len,
-                                100),
-                            TAG, "Failed to write ADV codec registers");
-        bulk_data += len;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t app_audio_i2s_adv_codec_enable(bool enabled)
-{
-    const uint8_t enabled_bulk_data[] = {
-        2, 0x00, 0x80,
-        2, 0x01, 0xBA,
-        2, 0x02, 0x18,
-        2, 0x0D, 0x01,
-        2, 0x0E, 0x02,
-        2, 0x14, APP_AUDIO_I2S_ADV_PGA_REG,
-        2, 0x17, APP_AUDIO_I2S_ADV_ADC_VOLUME_REG,
-        2, 0x1C, 0x6A,
-        0
-    };
-    static const uint8_t disabled_bulk_data[] = {
-        2, 0x0D, 0xFC,
-        2, 0x0E, 0x6A,
-        2, 0x00, 0x00,
-        0
-    };
-
-    return app_audio_i2s_adv_codec_write_bulk(enabled ? enabled_bulk_data : disabled_bulk_data);
-}
-
-static esp_err_t app_audio_i2s_adv_i2c_init(void)
-{
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = APP_AUDIO_I2S_ADV_I2C_PORT,
-        .sda_io_num = APP_AUDIO_I2S_ADV_I2C_SDA_GPIO,
-        .scl_io_num = APP_AUDIO_I2S_ADV_I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = APP_AUDIO_I2S_ADV_ES8311_ADDR,
-        .scl_speed_hz = 100000,
-    };
-
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_audio_i2s.i2c_bus), TAG,
-                        "Failed to create ADV I2C bus");
-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_audio_i2s.i2c_bus, &dev_cfg, &s_audio_i2s.i2c_dev), TAG,
-                        "Failed to add ADV codec I2C device");
-    return app_audio_i2s_adv_codec_enable(true);
-}
-
-static void app_audio_i2s_adv_i2c_deinit(void)
-{
-    if (s_audio_i2s.i2c_dev != NULL) {
-        app_audio_i2s_adv_codec_enable(false);
-        i2c_master_bus_rm_device(s_audio_i2s.i2c_dev);
-        s_audio_i2s.i2c_dev = NULL;
-    }
-    if (s_audio_i2s.i2c_bus != NULL) {
-        i2c_del_master_bus(s_audio_i2s.i2c_bus);
-        s_audio_i2s.i2c_bus = NULL;
-    }
 }
 
 static void app_audio_i2s_calc_clock_div(uint32_t *div_a, uint32_t *div_b, uint32_t *div_n,
@@ -345,8 +268,8 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(APP_AUDIO_I2S_PORT, I2S_ROLE_MASTER);
     esp_err_t err;
 
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 128;
+    chan_cfg.dma_desc_num = 4;
+    chan_cfg.dma_frame_num = 64;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_audio_i2s.rx_handle), TAG,
                         "Failed to allocate I2S RX channel");
 
@@ -354,7 +277,8 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
     {
         i2s_std_config_t std_rx_cfg = { 0 };
 
-        ESP_RETURN_ON_ERROR(app_audio_i2s_adv_i2c_init(), TAG, "Failed to init ADV codec");
+        ESP_RETURN_ON_ERROR(app_audio_adv_codec_acquire(), TAG, "Failed to acquire ADV codec");
+        ESP_RETURN_ON_ERROR(app_audio_adv_codec_enable_adc(true), TAG, "Failed to enable ADV codec ADC");
         std_rx_cfg.clk_cfg.sample_rate_hz = APP_AUDIO_I2S_CAPTURE_RATE;
         std_rx_cfg.clk_cfg.clk_src = I2S_CLK_SRC_PLL_160M;
         std_rx_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
@@ -377,10 +301,12 @@ static esp_err_t app_audio_i2s_init_channel_for_mode(const app_audio_i2s_mode_t 
 
         err = i2s_channel_init_std_mode(s_audio_i2s.rx_handle, &std_rx_cfg);
         if (err != ESP_OK) {
-            app_audio_i2s_adv_i2c_deinit();
+            app_audio_adv_codec_enable_adc(false);
+            app_audio_adv_codec_release();
             return err;
         }
         ESP_RETURN_ON_ERROR(i2s_channel_enable(s_audio_i2s.rx_handle), TAG, "Failed to enable ADV I2S RX channel");
+        vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_I2S_ADV_STARTUP_DELAY_MS));
         ESP_LOGI(TAG, "Initialized Cardputer ADV mic I2S RX on bck=%d ws=%d data=%d capture_rate=%d send_rate=%d slot=%s ws_inv=%d bclk_inv=%d (%s)",
                  APP_AUDIO_I2S_MIC_BCK_GPIO, APP_AUDIO_I2S_MIC_CLK_GPIO, APP_AUDIO_I2S_MIC_DATA_GPIO,
                  APP_AUDIO_I2S_CAPTURE_RATE, APP_AUDIO_SAMPLE_RATE,
@@ -427,7 +353,10 @@ static void app_audio_i2s_deinit_channel(void)
     i2s_channel_disable(s_audio_i2s.rx_handle);
     i2s_del_channel(s_audio_i2s.rx_handle);
     s_audio_i2s.rx_handle = NULL;
-    app_audio_i2s_adv_i2c_deinit();
+#if APP_AUDIO_I2S_USE_CARDPUTER_ADV
+    app_audio_adv_codec_enable_adc(false);
+    app_audio_adv_codec_release();
+#endif
 }
 
 static esp_err_t app_audio_i2s_switch_mode(uint8_t next_mode_index)
@@ -641,9 +570,9 @@ static void app_audio_i2s_task(void *arg)
         frame_start_us = esp_timer_get_time();
 #endif
 
-        if (!app_webrtc_is_audio_send_ready()) {
+        if (!app_session_is_audio_send_ready()) {
             if (!waiting_logged) {
-                ESP_LOGI(TAG, "Waiting for WebRTC connected state before sending mic audio");
+                ESP_LOGI(TAG, "Waiting for RTC connected state before sending mic audio");
                 waiting_logged = true;
             }
             continue;
@@ -670,7 +599,7 @@ static void app_audio_i2s_task(void *arg)
         }
 #endif
 
-        err = app_webrtc_send_audio(frame_data, frame_size, s_audio_i2s.pts);
+        err = app_session_send_audio(frame_data, frame_size, s_audio_i2s.pts);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Failed to send mic audio frame: %s", esp_err_to_name(err));
 #if APP_AUDIO_I2S_PROFILE_ENABLE
@@ -780,6 +709,8 @@ esp_err_t app_audio_i2s_start(void)
     s_audio_i2s.running = true;
     s_audio_i2s.frame_count = 0;
     s_audio_i2s.pts = 0;
+
+    ESP_LOGI(TAG, "Free heap before mic task create: %u", (unsigned)esp_get_free_heap_size());
 
     if (xTaskCreate(app_audio_i2s_task, "app_audio_i2s", APP_AUDIO_I2S_STACK_SIZE, NULL, 4,
                     &s_audio_i2s.task) != pdPASS) {

@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_peer.h"
 #include "esp_peer_default.h"
+#include "esp_peer_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -26,10 +27,22 @@ typedef struct {
     esp_peer_state_t state;
     bool initialized;
     bool loop_running;
-} app_webrtc_ctx_t;
+    app_webrtc_session_role_t role;
+    app_webrtc_audio_info_cb_t audio_info_cb;
+    app_webrtc_audio_frame_cb_t audio_frame_cb;
+    void *audio_cb_ctx;
+    esp_peer_rtp_transform_cb_t rtp_transform_cb;
+    uint32_t recv_rtp_packets;
+    uint32_t recv_rtp_bytes;
+} app_webrtc_session_t;
 
 static const char *TAG = "app_webrtc";
-static app_webrtc_ctx_t s_webrtc;
+static app_webrtc_session_t s_sessions[2];
+
+static const char *app_webrtc_role_name(app_webrtc_session_role_t role)
+{
+    return role == APP_WEBRTC_SESSION_PULL ? "pull" : "push";
+}
 
 static esp_peer_audio_codec_t app_webrtc_audio_codec(void)
 {
@@ -56,73 +69,143 @@ static esp_err_t app_webrtc_peer_err(int peer_err)
     }
 }
 
-static void app_webrtc_replace_offer_locked(const uint8_t *data, int size)
+static app_webrtc_session_t *app_webrtc_get_session(app_webrtc_session_role_t role)
+{
+    return &s_sessions[(int)role];
+}
+
+static void app_webrtc_replace_offer_locked(app_webrtc_session_t *session, const uint8_t *data, int size)
 {
     char *offer;
 
-    if (data == NULL || size <= 0) {
+    if (session == NULL || data == NULL || size <= 0) {
         return;
     }
     offer = calloc(1, (size_t)size + 1);
     if (offer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate local SDP buffer");
+        ESP_LOGE(TAG, "[%s] Failed to allocate local SDP buffer", app_webrtc_role_name(session->role));
         return;
     }
     memcpy(offer, data, (size_t)size);
 
-    free(s_webrtc.pending_offer);
-    s_webrtc.pending_offer = offer;
+    free(session->pending_offer);
+    session->pending_offer = offer;
 }
 
 static int app_webrtc_on_state(esp_peer_state_t state, void *ctx)
 {
-    (void)ctx;
-    s_webrtc.state = state;
-    if (s_webrtc.loop_task != NULL) {
-        UBaseType_t watermark = uxTaskGetStackHighWaterMark(s_webrtc.loop_task);
-        ESP_LOGI(TAG, "Peer state changed: %d (stack watermark=%u words)", (int)state, (unsigned)watermark);
+    app_webrtc_session_t *session = (app_webrtc_session_t *)ctx;
+
+    if (session == NULL) {
+        return 0;
+    }
+    session->state = state;
+    if (session->loop_task != NULL) {
+        UBaseType_t watermark = uxTaskGetStackHighWaterMark(session->loop_task);
+        ESP_LOGI(TAG, "[%s] Peer state changed: %d (stack watermark=%u words)",
+                 app_webrtc_role_name(session->role), (int)state, (unsigned)watermark);
     } else {
-        ESP_LOGI(TAG, "Peer state changed: %d", (int)state);
+        ESP_LOGI(TAG, "[%s] Peer state changed: %d", app_webrtc_role_name(session->role), (int)state);
     }
     return 0;
 }
 
 static int app_webrtc_on_msg(esp_peer_msg_t *msg, void *ctx)
 {
-    (void)ctx;
+    app_webrtc_session_t *session = (app_webrtc_session_t *)ctx;
 
-    if (msg == NULL || msg->data == NULL || msg->size <= 0) {
+    if (session == NULL || msg == NULL || msg->data == NULL || msg->size <= 0) {
         return 0;
     }
     if (msg->type == ESP_PEER_MSG_TYPE_SDP) {
-        if (xSemaphoreTake(s_webrtc.lock, portMAX_DELAY) == pdTRUE) {
-            app_webrtc_replace_offer_locked(msg->data, msg->size);
-            xSemaphoreGive(s_webrtc.lock);
-            xSemaphoreGive(s_webrtc.offer_ready);
+        if (xSemaphoreTake(session->lock, portMAX_DELAY) == pdTRUE) {
+            app_webrtc_replace_offer_locked(session, msg->data, msg->size);
+            xSemaphoreGive(session->lock);
+            xSemaphoreGive(session->offer_ready);
         }
-        ESP_LOGI(TAG, "Captured local SDP offer (%d bytes)", msg->size);
+        ESP_LOGI(TAG, "[%s] Captured local SDP offer (%d bytes)", app_webrtc_role_name(session->role), msg->size);
     } else if (msg->type == ESP_PEER_MSG_TYPE_CANDIDATE) {
-        ESP_LOGI(TAG, "Ignoring local ICE candidate during M4 (%d bytes)", msg->size);
+        ESP_LOGI(TAG, "[%s] Ignoring local ICE candidate during M4 (%d bytes)",
+                 app_webrtc_role_name(session->role), msg->size);
     }
     return 0;
 }
 
+static int app_webrtc_on_audio_info(esp_peer_audio_stream_info_t *info, void *ctx)
+{
+    app_webrtc_session_t *session = (app_webrtc_session_t *)ctx;
+
+    if (session == NULL || info == NULL) {
+        return 0;
+    }
+    ESP_LOGI(TAG, "[%s] Remote audio info: codec=%d sample_rate=%u channels=%u",
+             app_webrtc_role_name(session->role), (int)info->codec, (unsigned)info->sample_rate, (unsigned)info->channel);
+    if (session->audio_info_cb != NULL) {
+        session->audio_info_cb(info, session->audio_cb_ctx);
+    }
+    return 0;
+}
+
+static int app_webrtc_on_audio_data(esp_peer_audio_frame_t *frame, void *ctx)
+{
+    app_webrtc_session_t *session = (app_webrtc_session_t *)ctx;
+
+    if (session == NULL || frame == NULL) {
+        return 0;
+    }
+    if (session->audio_frame_cb != NULL) {
+        session->audio_frame_cb(frame, session->audio_cb_ctx);
+    }
+    return 0;
+}
+
+static int app_webrtc_get_rtp_encoded_size(esp_peer_rtp_frame_t *frame, bool *in_place, void *ctx)
+{
+    (void)ctx;
+    if (frame == NULL || in_place == NULL) {
+        return ESP_PEER_ERR_INVALID_ARG;
+    }
+    *in_place = true;
+    frame->encoded_size = frame->orig_size;
+    return ESP_PEER_ERR_NONE;
+}
+
+static int app_webrtc_transform_incoming_rtp(esp_peer_rtp_frame_t *frame, void *ctx)
+{
+    app_webrtc_session_t *session = (app_webrtc_session_t *)ctx;
+
+    if (frame == NULL || session == NULL) {
+        return ESP_PEER_ERR_INVALID_ARG;
+    }
+    session->recv_rtp_packets++;
+    session->recv_rtp_bytes += frame->orig_size;
+    if (session->recv_rtp_packets == 1U || (session->recv_rtp_packets % 100U) == 0U) {
+        ESP_LOGI(TAG, "[%s] Inbound RTP packets: %u bytes=%u payload_type=%u",
+                 app_webrtc_role_name(session->role),
+                 (unsigned)session->recv_rtp_packets,
+                 (unsigned)session->recv_rtp_bytes,
+                 (unsigned)frame->payload_type);
+    }
+    return ESP_PEER_ERR_NONE;
+}
+
 static void app_webrtc_loop_task(void *arg)
 {
-    app_webrtc_ctx_t *ctx = (app_webrtc_ctx_t *)arg;
+    app_webrtc_session_t *session = (app_webrtc_session_t *)arg;
 
-    while (ctx->loop_running) {
-        if (ctx->peer != NULL) {
-            esp_peer_main_loop(ctx->peer);
+    while (session->loop_running) {
+        if (session->peer != NULL) {
+            esp_peer_main_loop(session->peer);
         }
         vTaskDelay(pdMS_TO_TICKS(APP_WEBRTC_LOOP_DELAY_MS));
     }
-    ctx->loop_task = NULL;
+    session->loop_task = NULL;
     vTaskDelete(NULL);
 }
 
-esp_err_t app_webrtc_init(void)
+esp_err_t app_webrtc_init_session(app_webrtc_session_role_t role)
 {
+    app_webrtc_session_t *session = app_webrtc_get_session(role);
     esp_peer_default_cfg_t default_cfg = {
         .agent_recv_timeout = APP_WEBRTC_AGENT_RECV_TIMEOUT_MS,
         .rtp_cfg = {
@@ -141,53 +224,69 @@ esp_err_t app_webrtc_init(void)
         .video_info = {
             .codec = ESP_PEER_VIDEO_CODEC_NONE,
         },
-        .audio_dir = ESP_PEER_MEDIA_DIR_SEND_ONLY,
+        .audio_dir = role == APP_WEBRTC_SESSION_PULL ? ESP_PEER_MEDIA_DIR_RECV_ONLY : ESP_PEER_MEDIA_DIR_SEND_ONLY,
         .video_dir = ESP_PEER_MEDIA_DIR_NONE,
         .enable_data_channel = false,
         .on_state = app_webrtc_on_state,
         .on_msg = app_webrtc_on_msg,
+        .on_audio_info = role == APP_WEBRTC_SESSION_PULL ? app_webrtc_on_audio_info : NULL,
+        .on_audio_data = role == APP_WEBRTC_SESSION_PULL ? app_webrtc_on_audio_data : NULL,
+        .ctx = session,
         .extra_cfg = &default_cfg,
         .extra_size = sizeof(default_cfg),
     };
     int peer_err;
 
-    if (s_webrtc.initialized) {
+    if (session->initialized) {
         return ESP_OK;
     }
 
-    s_webrtc.offer_ready = xSemaphoreCreateBinary();
-    s_webrtc.lock = xSemaphoreCreateMutex();
-    if (s_webrtc.offer_ready == NULL || s_webrtc.lock == NULL) {
+    session->role = role;
+    session->offer_ready = xSemaphoreCreateBinary();
+    session->lock = xSemaphoreCreateMutex();
+    if (session->offer_ready == NULL || session->lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
     peer_err = esp_peer_pre_generate_cert();
     if (peer_err != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "esp_peer_pre_generate_cert failed: %d", peer_err);
+        ESP_LOGE(TAG, "[%s] esp_peer_pre_generate_cert failed: %d", app_webrtc_role_name(role), peer_err);
         return app_webrtc_peer_err(peer_err);
     }
 
-    peer_err = esp_peer_open(&cfg, esp_peer_get_default_impl(), &s_webrtc.peer);
+    peer_err = esp_peer_open(&cfg, esp_peer_get_default_impl(), &session->peer);
     if (peer_err != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "esp_peer_open failed: %d", peer_err);
+        ESP_LOGE(TAG, "[%s] esp_peer_open failed: %d", app_webrtc_role_name(role), peer_err);
         return app_webrtc_peer_err(peer_err);
     }
+    if (role == APP_WEBRTC_SESSION_PULL) {
+        session->rtp_transform_cb = (esp_peer_rtp_transform_cb_t){
+            .get_encoded_size = app_webrtc_get_rtp_encoded_size,
+            .transform = app_webrtc_transform_incoming_rtp,
+        };
+        peer_err = esp_peer_set_rtp_transformer(session->peer, ESP_PEER_RTP_TRANSFORM_ROLE_RECEIVER,
+                                                &session->rtp_transform_cb, session);
+        if (peer_err != ESP_PEER_ERR_NONE) {
+            ESP_LOGW(TAG, "[%s] Failed to set RTP receiver transformer: %d", app_webrtc_role_name(role), peer_err);
+        }
+    }
 
-    s_webrtc.loop_running = true;
-    if (xTaskCreate(app_webrtc_loop_task, "app_webrtc", APP_WEBRTC_LOOP_STACK_SIZE, &s_webrtc, 5,
-                    &s_webrtc.loop_task) != pdPASS) {
-        s_webrtc.loop_running = false;
-        esp_peer_close(s_webrtc.peer);
-        s_webrtc.peer = NULL;
+    session->loop_running = true;
+    if (xTaskCreate(app_webrtc_loop_task, role == APP_WEBRTC_SESSION_PULL ? "app_webrtc_pull" : "app_webrtc_push",
+                    APP_WEBRTC_LOOP_STACK_SIZE, session, 5, &session->loop_task) != pdPASS) {
+        session->loop_running = false;
+        esp_peer_close(session->peer);
+        session->peer = NULL;
         return ESP_ERR_NO_MEM;
     }
 
-    s_webrtc.initialized = true;
+    session->initialized = true;
     return ESP_OK;
 }
 
-esp_err_t app_webrtc_create_audio_offer(app_webrtc_offer_t *out_offer)
+esp_err_t app_webrtc_create_audio_offer_for_role(app_webrtc_session_role_t role, app_webrtc_offer_t *out_offer)
 {
+    app_webrtc_session_t *session = app_webrtc_get_session(role);
     int peer_err;
     char *offer_copy = NULL;
 
@@ -196,35 +295,35 @@ esp_err_t app_webrtc_create_audio_offer(app_webrtc_offer_t *out_offer)
     }
     out_offer->sdp_offer = NULL;
 
-    ESP_RETURN_ON_ERROR(app_webrtc_init(), TAG, "Failed to initialize WebRTC");
+    ESP_RETURN_ON_ERROR(app_webrtc_init_session(role), TAG, "Failed to initialize WebRTC session");
 
-    if (xSemaphoreTake(s_webrtc.lock, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(session->lock, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
-    free(s_webrtc.pending_offer);
-    s_webrtc.pending_offer = NULL;
-    xSemaphoreGive(s_webrtc.lock);
+    free(session->pending_offer);
+    session->pending_offer = NULL;
+    xSemaphoreGive(session->lock);
 
-    while (xSemaphoreTake(s_webrtc.offer_ready, 0) == pdTRUE) {
+    while (xSemaphoreTake(session->offer_ready, 0) == pdTRUE) {
     }
 
-    peer_err = esp_peer_new_connection(s_webrtc.peer);
+    peer_err = esp_peer_new_connection(session->peer);
     if (peer_err != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "esp_peer_new_connection failed: %d", peer_err);
+        ESP_LOGE(TAG, "[%s] esp_peer_new_connection failed: %d", app_webrtc_role_name(role), peer_err);
         return app_webrtc_peer_err(peer_err);
     }
 
-    if (xSemaphoreTake(s_webrtc.offer_ready, pdMS_TO_TICKS(APP_WEBRTC_OFFER_TIMEOUT_MS)) != pdTRUE) {
+    if (xSemaphoreTake(session->offer_ready, pdMS_TO_TICKS(APP_WEBRTC_OFFER_TIMEOUT_MS)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
-    if (xSemaphoreTake(s_webrtc.lock, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(session->lock, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
-    if (s_webrtc.pending_offer != NULL) {
-        offer_copy = strdup(s_webrtc.pending_offer);
+    if (session->pending_offer != NULL) {
+        offer_copy = strdup(session->pending_offer);
     }
-    xSemaphoreGive(s_webrtc.lock);
+    xSemaphoreGive(session->lock);
 
     if (offer_copy == NULL) {
         return ESP_FAIL;
@@ -233,12 +332,13 @@ esp_err_t app_webrtc_create_audio_offer(app_webrtc_offer_t *out_offer)
     return ESP_OK;
 }
 
-esp_err_t app_webrtc_set_remote_answer(const char *sdp_answer)
+esp_err_t app_webrtc_set_remote_answer_for_role(app_webrtc_session_role_t role, const char *sdp_answer)
 {
+    app_webrtc_session_t *session = app_webrtc_get_session(role);
     esp_peer_msg_t msg;
     int peer_err;
 
-    if (sdp_answer == NULL || s_webrtc.peer == NULL) {
+    if (sdp_answer == NULL || session->peer == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -246,25 +346,49 @@ esp_err_t app_webrtc_set_remote_answer(const char *sdp_answer)
     msg.data = (uint8_t *)sdp_answer;
     msg.size = (int)strlen(sdp_answer);
 
-    peer_err = esp_peer_send_msg(s_webrtc.peer, &msg);
+    peer_err = esp_peer_send_msg(session->peer, &msg);
     if (peer_err != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "esp_peer_send_msg(answer) failed: %d", peer_err);
+        ESP_LOGE(TAG, "[%s] esp_peer_send_msg(answer) failed: %d", app_webrtc_role_name(role), peer_err);
         return app_webrtc_peer_err(peer_err);
     }
     return ESP_OK;
 }
 
-esp_err_t app_webrtc_start(void)
+esp_err_t app_webrtc_set_audio_receive_callbacks(app_webrtc_session_role_t role,
+                                                 app_webrtc_audio_info_cb_t info_cb,
+                                                 app_webrtc_audio_frame_cb_t frame_cb,
+                                                 void *cb_ctx)
 {
-    return app_webrtc_init();
+    app_webrtc_session_t *session = app_webrtc_get_session(role);
+
+    session->audio_info_cb = info_cb;
+    session->audio_frame_cb = frame_cb;
+    session->audio_cb_ctx = cb_ctx;
+    return ESP_OK;
+}
+
+esp_err_t app_webrtc_query_session(app_webrtc_session_role_t role)
+{
+    app_webrtc_session_t *session = app_webrtc_get_session(role);
+
+    if (session->peer == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI(TAG, "[%s] Query stats before peer query: recv_rtp_packets=%u recv_rtp_bytes=%u state=%d",
+             app_webrtc_role_name(role),
+             (unsigned)session->recv_rtp_packets,
+             (unsigned)session->recv_rtp_bytes,
+             (int)session->state);
+    return app_webrtc_peer_err(esp_peer_query(session->peer));
 }
 
 esp_err_t app_webrtc_send_audio(const void *data, size_t size, uint32_t pts)
 {
+    app_webrtc_session_t *session = app_webrtc_get_session(APP_WEBRTC_SESSION_PUSH);
     esp_peer_audio_frame_t frame;
     int peer_err;
 
-    if (data == NULL || size == 0 || s_webrtc.peer == NULL) {
+    if (data == NULL || size == 0 || session->peer == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!app_webrtc_is_audio_send_ready()) {
@@ -275,9 +399,9 @@ esp_err_t app_webrtc_send_audio(const void *data, size_t size, uint32_t pts)
     frame.size = (int)size;
     frame.pts = pts;
 
-    peer_err = esp_peer_send_audio(s_webrtc.peer, &frame);
+    peer_err = esp_peer_send_audio(session->peer, &frame);
     if (peer_err != ESP_PEER_ERR_NONE) {
-        ESP_LOGE(TAG, "esp_peer_send_audio failed: %d", peer_err);
+        ESP_LOGE(TAG, "[push] esp_peer_send_audio failed: %d", peer_err);
         return app_webrtc_peer_err(peer_err);
     }
     return ESP_OK;
@@ -285,7 +409,7 @@ esp_err_t app_webrtc_send_audio(const void *data, size_t size, uint32_t pts)
 
 bool app_webrtc_is_audio_send_ready(void)
 {
-    return s_webrtc.state == ESP_PEER_STATE_CONNECTED;
+    return app_webrtc_get_session(APP_WEBRTC_SESSION_PUSH)->state == ESP_PEER_STATE_CONNECTED;
 }
 
 void app_webrtc_destroy_offer(app_webrtc_offer_t *offer)

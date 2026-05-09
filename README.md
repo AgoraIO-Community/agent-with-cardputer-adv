@@ -1,6 +1,6 @@
-# Cardputer Agora WHIP Publisher
+# Cardputer Agora WHIP Push + Pull Audio
 
-ESP32-S3 / M5Stack Cardputer audio-only WebRTC publisher using WHIP on the current `esp_peer` stack.
+ESP32-S3 / M5Stack Cardputer audio-only WebRTC client using Agora WHIP `/push` for mic publish and `/pull` for remote speaker playback on the current `esp_peer` stack.
 
 ## Current Stage
 
@@ -21,6 +21,7 @@ Hardware-verified status on May 9, 2026:
 - fake audio frames are sent continuously
 - Cardputer ADV microphone capture works on hardware
 - live mic frames are sent continuously over the G.711A path
+- Agora WHIP `/pull` is supported and used for remote audio subscribe
 
 ## Build
 
@@ -71,9 +72,11 @@ For local development:
 4. Generates an Agora WHIP JWT at runtime
 5. Posts the offer to Agora WHIP and receives the SDP answer
 6. Completes ICE, DTLS, and SRTP setup
-7. Sends fake audio frames by default, or can start the real Cardputer ADV I2S mic path when `APP_AUDIO_USE_I2S_MIC` is enabled
-8. Uses G.711A as the stable codec baseline for live mic publishing
-9. Auto-tunes Cardputer ADV mic framing across the known slot / inversion variants if the first capture mode looks constant-valued
+7. Creates a second WHIP `/pull` subscriber session using `APP_AGORA_REMOTE_PULL_UID`
+8. Plays received remote audio through the Cardputer ADV ES8311 speaker path when playback is enabled
+9. Sends fake audio frames by default, or can start the real Cardputer ADV I2S mic path when `APP_AUDIO_USE_I2S_MIC` is enabled
+10. Uses G.711A as the stable codec baseline for live mic publish and pull playback
+11. Auto-tunes Cardputer ADV mic framing across the known slot / inversion variants if the first capture mode looks constant-valued
 
 ## Expected Serial Milestones
 
@@ -82,10 +85,18 @@ On a working run, the monitor should show lines like:
 - `Wi-Fi connected`
 - `IP address: ...`
 - `WHIP POST status: 201`
+- `Pull remote SDP answer:`
 - `Peer state changed: 5`
 - `DTLS handshake success`
 - `Peer state changed: 7`
 - `Fake audio frames sent: 250`
+
+For remote speaker playback, you should also see lines like:
+
+- `Cardputer ADV speaker playback ready; waiting for remote audio`
+- `Remote audio stream callback fired: codec=1 sample_rate=8000 channels=1`
+- `Opened Cardputer ADV speaker I2S TX on bck=41 ws=43 dout=42 ...`
+- `First remote audio frame written to speaker: ...`
 
 For the real mic path, you should instead see lines like:
 
@@ -104,7 +115,7 @@ If the initial ADV framing is wrong, you may also see lines like:
 - The display is not used yet.
 - Local Wi-Fi and Agora values must be supplied through `src/app_config_local.h`.
 - The stable live-mic path currently uses `APP_AUDIO_CODEC_G711A`.
-- The current firmware is a WHIP publish-only baseline. Agora WHIP `/push` on this stack is not treated as a remote-audio playback path.
+- Remote playback now uses a separate WHIP `/pull` session. `/push` remains publish-only and is not expected to loop remote media back on the same session.
 - Experimental Opus send attempts are not usable on the current prebuilt `esp_peer` implementation:
   - Agora WHIP only accepts the Opus offer as `opus/48000/2`
   - the send path then faults inside the prebuilt peer-default RTP audio packetization code
@@ -118,6 +129,7 @@ Use the known-good Cardputer ADV mic baseline:
 1. Set these in `src/app_config_local.h`:
    - `APP_AUDIO_USE_I2S_MIC 1`
    - `APP_AUDIO_CODEC APP_AUDIO_CODEC_G711A`
+   - `APP_AGORA_REMOTE_PULL_UID "..."` with the remote publisher UID you want to subscribe to
    - `APP_AUDIO_I2S_USE_CARDPUTER_ADV 1`
    - `APP_AUDIO_I2S_PORT I2S_NUM_1`
    - `APP_AUDIO_I2S_MIC_BCK_GPIO GPIO_NUM_41`
@@ -132,6 +144,8 @@ Use the known-good Cardputer ADV mic baseline:
    - `Cardputer mic audio publisher started`
    - `Initialized Cardputer ADV mic I2S RX ...`
    - `Mic audio frames sent: ... avg_abs=... peak=...`
+   - `Remote audio stream callback fired: ...`
+   - `First remote audio frame written to speaker: ...`
    - WebRTC still reaching DTLS/SRTP connected state
 4. If the mic frames flow but remote audio quality still needs work, continue tuning the stable G.711A path first.
 5. Treat Opus as a separate follow-up investigation that likely requires a source-available peer implementation or a different WebRTC stack.
