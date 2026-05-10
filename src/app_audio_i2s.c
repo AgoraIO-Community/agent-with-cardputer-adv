@@ -69,6 +69,39 @@ typedef struct {
 static const char *TAG = "app_audio_i2s";
 static app_audio_i2s_ctx_t s_audio_i2s;
 
+static int16_t app_audio_i2s_soft_limit(int32_t sample, uint32_t *limited_count)
+{
+    int32_t sign = sample < 0 ? -1 : 1;
+    int32_t magnitude = sample < 0 ? -sample : sample;
+    const int32_t knee = APP_AUDIO_I2S_SOFT_KNEE;
+    const int32_t limit = APP_AUDIO_I2S_OUTPUT_LIMIT;
+
+    if (limit <= 0) {
+        return 0;
+    }
+    if (magnitude <= knee || knee >= limit) {
+        if (magnitude > limit) {
+            magnitude = limit;
+            if (limited_count != NULL) {
+                (*limited_count)++;
+            }
+        }
+        return (int16_t)(sign * magnitude);
+    }
+
+    if (limited_count != NULL) {
+        (*limited_count)++;
+    }
+
+    int32_t over = magnitude - knee;
+    int32_t range = limit - knee;
+    magnitude = knee + (over * range) / (over + range);
+    if (magnitude > limit) {
+        magnitude = limit;
+    }
+    return (int16_t)(sign * magnitude);
+}
+
 typedef struct {
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
     bool left_slot;
@@ -665,16 +698,12 @@ static void app_audio_i2s_task(void *arg)
 
         int32_t peak = 0;
         int64_t abs_sum = 0;
+        uint32_t limited_count = 0;
         for (size_t i = 0; i < sample_count; i++) {
             int32_t amplified = ((int32_t)frame_buffer[i] * APP_AUDIO_I2S_GAIN_NUM) / APP_AUDIO_I2S_GAIN_DEN;
-            if (amplified > INT16_MAX) {
-                amplified = INT16_MAX;
-            } else if (amplified < INT16_MIN) {
-                amplified = INT16_MIN;
-            }
-            frame_buffer[i] = (int16_t)amplified;
+            frame_buffer[i] = app_audio_i2s_soft_limit(amplified, &limited_count);
 
-            int32_t magnitude = amplified < 0 ? -amplified : amplified;
+            int32_t magnitude = frame_buffer[i] < 0 ? -frame_buffer[i] : frame_buffer[i];
             if (magnitude > peak) {
                 peak = magnitude;
             }
@@ -775,13 +804,15 @@ static void app_audio_i2s_task(void *arg)
             uint32_t avg_abs = sample_count ? (uint32_t)(abs_sum / (int64_t)sample_count) : 0U;
             bool near_zero = raw_avg_abs <= 8U && raw_peak <= 32;
             bool constant_or_near_zero = all_same || near_zero;
-            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d)",
+            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d knee=%d limit=%d limited=%u)",
                      (unsigned)s_audio_i2s.processed_frame_count,
                      (unsigned)s_audio_i2s.sent_frame_count,
                      (unsigned)bytes_read,
                      (unsigned)raw_avg_abs, (unsigned)raw_peak,
                      (unsigned)avg_abs, (unsigned)peak, (unsigned)zero_crossings, (int)first_sample,
-                     APP_AUDIO_I2S_GAIN_NUM, APP_AUDIO_I2S_GAIN_DEN);
+                     APP_AUDIO_I2S_GAIN_NUM, APP_AUDIO_I2S_GAIN_DEN,
+                     APP_AUDIO_I2S_SOFT_KNEE, APP_AUDIO_I2S_OUTPUT_LIMIT,
+                     (unsigned)limited_count);
 #if APP_AUDIO_I2S_PROFILE_ENABLE
             {
                 uint32_t avg_frame_time_us = s_audio_i2s.profile_window_frames
