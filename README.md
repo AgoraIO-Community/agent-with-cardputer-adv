@@ -1,10 +1,18 @@
 ![Cardputer Voice Agent banner](assets/readme-banner.png)
 
-# Cardputer Voice Agent With Agora Conversational AI
+## Table Of Contents
+
+- [🤖 Cardputer Voice Agent With Agora Conversational AI](#-cardputer-voice-agent-with-agora-conversational-ai)
+- [🚀 Quickstart](#-quickstart)
+  - [✨ Option 1: Use Your AI Coding Tool](#-option-1-use-your-ai-coding-tool)
+  - [🛠️ Option 2: Manual Setup](#️-option-2-manual-setup)
+- [💻 Develop With PlatformIO](#-develop-with-platformio)
+
+# 🤖 Cardputer Voice Agent With Agora Conversational AI
 
 Run an Agora Conversational AI voice agent on M5Stack Cardputer ADV. The firmware connects over Wi-Fi to a local quickstart server, joins Agora RTSA, and lets you talk with the agent from the Cardputer.
 
-## Quickstart
+## 🚀 Quickstart
 
 This firmware talks to a local voice agent server. The easiest server path is Agora's official Conversational AI quickstart:
 
@@ -12,7 +20,9 @@ This firmware talks to a local voice agent server. The easiest server path is Ag
 
 Run that server on your PC, keep the Cardputer and your PC on the same Wi-Fi, then use your PC's LAN address on port `8000` as the firmware server URL, for example `http://192.168.0.101:8000`.
 
-### Option 1: Use Your AI Coding Tool
+### ✨ Option 1: Use Your AI Coding Tool
+
+This is the recommended path. The setup touches the firmware repo, Agora project setup, the local voice agent server, LAN IP discovery, and device flashing; an AI coding tool can follow the full checklist in `docs/ai-quickstart.md` and reduce manual mistakes.
 
 If you use Codex, Claude Code, Cursor, Windsurf, Copilot, or another AI coding assistant, install Agora's skill first so the assistant has Agora-specific setup guidance:
 
@@ -39,7 +49,17 @@ pio device monitor
 
 Press `k` on the Cardputer keyboard to start the agent.
 
-### Option 2: Manual Setup
+### 🛠️ Option 2: Manual Setup
+
+Manual setup follows the same flow as `docs/ai-quickstart.md`, but you run each step yourself.
+
+Before configuring the server, use Agora CLI to create or prepare an Agora project with the required features enabled and retrieve the App ID and App Certificate:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AgoraIO/cli/main/install.sh | sh -s -- --add-to-path
+```
+
+Follow the Agora CLI prompts to log in, select or create a project, enable the mandatory features for Conversational AI, and get the project credentials.
 
 Set up the local voice agent server first:
 
@@ -51,7 +71,7 @@ cd server-python
 cp .env.example .env.local
 ```
 
-Edit `server-python/.env.local` and fill in your Agora `APP_ID` and `APP_CERTIFICATE`.
+Edit `server-python/.env.local` and set the Agora `APP_ID` and `APP_CERTIFICATE` from the CLI-created or CLI-selected project.
 
 Start both the web client and backend:
 
@@ -112,7 +132,7 @@ pio device monitor
 
 On a working run, the serial monitor should show Wi-Fi connection, protocol config, RTSA join, and agent start logs. Press `k` on the Cardputer keyboard to start the agent.
 
-## Develop With PlatformIO
+## 💻 Develop With PlatformIO
 
 Open this repo in VS Code and install the PlatformIO IDE extension. PlatformIO should detect the `cardputer-whip` environment from `platformio.ini`.
 
