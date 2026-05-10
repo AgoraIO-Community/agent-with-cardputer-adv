@@ -261,7 +261,7 @@ static void app_audio_controller_task(void *arg)
 
         if (xSemaphoreTake(s_audio_controller.lock, portMAX_DELAY) == pdTRUE) {
             if (s_audio_controller.mode == APP_AUDIO_MODE_PLAYBACK) {
-                should_send_silence = true;
+                should_send_silence = APP_AUDIO_SEND_SILENCE_DURING_PLAYBACK != 0;
                 if (s_audio_controller.last_remote_active_frame_us != 0 &&
                     (now_us - s_audio_controller.last_remote_active_frame_us) >
                         ((int64_t)APP_AUDIO_REMOTE_TAIL_MS * 1000LL) &&

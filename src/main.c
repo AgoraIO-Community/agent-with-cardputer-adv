@@ -4,6 +4,7 @@
 #include "app_audio_playback.h"
 #include "app_audio_adv_codec.h"
 #include "app_config.h"
+#include "app_display.h"
 #include "app_https.h"
 #include "app_protocol.h"
 #include "app_rtsa.h"
@@ -344,6 +345,7 @@ void app_main(void)
     esp_err_t err;
     bool audio_started = false;
     bool agent_started = false;
+    bool display_started = false;
 
     ESP_LOGI(TAG, "Cardputer RTSA protocol client starting");
 
@@ -368,6 +370,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(app_audio_controller_init());
     ESP_ERROR_CHECK(app_rtsa_start(&protocol_cfg));
+    if (!display_started) {
+        ESP_ERROR_CHECK(app_display_start());
+        display_started = true;
+    }
     if (APP_AGORA_AUTO_START) {
 #if APP_AGORA_START_ON_KEYPRESS
         ESP_ERROR_CHECK(app_wait_for_start_key());

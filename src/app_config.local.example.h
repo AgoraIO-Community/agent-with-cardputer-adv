@@ -20,6 +20,7 @@
 
 #define APP_AUDIO_ENABLE_PULL_PLAYBACK 1
 #define APP_AUDIO_ENABLE_HALF_DUPLEX_GATING 1
+#define APP_AUDIO_SEND_SILENCE_DURING_PLAYBACK 0
 #define APP_AUDIO_PLAYBACK_RUN_SELF_TEST 0
 
 #define APP_AUDIO_I2S_USE_CARDPUTER_ADV 1
@@ -45,6 +46,20 @@
  */
 #define APP_AUDIO_PLAYBACK_GAIN_NUM 24
 #define APP_AUDIO_PLAYBACK_GAIN_DEN 1
+
+/*
+ * Cardputer ADV LCD. The UI shows a pixel pet that dances during playback and
+ * pauses during recording, with a small keyboard hint in the bottom-right.
+ * Disable this if you need to reclaim the SPI pins or a small amount of RAM.
+ */
+#define APP_DISPLAY_ENABLE 1
+#define APP_DISPLAY_MOSI_GPIO GPIO_NUM_35
+#define APP_DISPLAY_SCLK_GPIO GPIO_NUM_36
+#define APP_DISPLAY_CS_GPIO GPIO_NUM_37
+#define APP_DISPLAY_DC_GPIO GPIO_NUM_34
+#define APP_DISPLAY_RST_GPIO GPIO_NUM_33
+#define APP_DISPLAY_BL_GPIO GPIO_NUM_38
+#define APP_DISPLAY_STATUS_TEXT "Press k to start agent"
 
 #define APP_AUDIO_I2S_ADV_I2C_PORT I2C_NUM_1
 #define APP_AUDIO_I2S_ADV_I2C_SDA_GPIO GPIO_NUM_8

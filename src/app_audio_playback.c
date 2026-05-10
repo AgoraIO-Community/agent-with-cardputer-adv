@@ -10,6 +10,7 @@
 #include "app_config.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -205,9 +206,11 @@ static esp_err_t app_audio_playback_init_codec_locked(uint32_t sample_rate)
 
     s_playback.codec_stack_inited = true;
     s_playback.configured_sample_rate = sample_rate;
-    ESP_LOGI(TAG, "Opened direct Cardputer playback I2S/DAC path on bck=%d ws=%d dout=%d sample_rate=%u",
+    ESP_LOGI(TAG, "Opened direct Cardputer playback I2S/DAC path on bck=%d ws=%d dout=%d sample_rate=%u free=%u largest=%u",
              APP_AUDIO_I2S_SPK_BCK_GPIO, APP_AUDIO_I2S_SPK_WS_GPIO, APP_AUDIO_I2S_SPK_DOUT_GPIO,
-             (unsigned)sample_rate);
+             (unsigned)sample_rate,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     return ESP_OK;
 
 fail:
@@ -240,6 +243,9 @@ static esp_err_t app_audio_playback_close_stream_locked(void)
         app_audio_adv_codec_release();
         s_playback.codec_stack_inited = false;
         s_playback.configured_sample_rate = 0;
+        ESP_LOGI(TAG, "Closed direct Cardputer playback I2S/DAC path free=%u largest=%u",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
     app_audio_playback_reset_stream_state_locked();
     return ret;

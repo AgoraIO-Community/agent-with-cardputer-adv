@@ -5,6 +5,7 @@ idf_component_register(
         ${CMAKE_SOURCE_DIR}/src/app_codec_g722.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_controller.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_adv_codec.c
+        ${CMAKE_SOURCE_DIR}/src/app_display.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_fake.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_i2s.c
         ${CMAKE_SOURCE_DIR}/src/app_audio_playback.c

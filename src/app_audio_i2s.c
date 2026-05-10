@@ -30,7 +30,7 @@
 #include <soc/pcr_struct.h>
 #endif
 
-#define APP_AUDIO_I2S_STACK_SIZE 6144
+#define APP_AUDIO_I2S_STACK_SIZE 3072
 #define APP_AUDIO_I2S_READ_TIMEOUT_MS 100
 #define APP_AUDIO_I2S_PLL_D2_CLK 120000000U
 #define APP_AUDIO_I2S_OVERSAMPLING 2
@@ -44,6 +44,8 @@ typedef struct {
     TaskHandle_t task;
     i2s_chan_handle_t rx_handle;
     bool running;
+    bool stop_requested;
+    bool task_idle;
     uint32_t processed_frame_count;
     uint32_t sent_frame_count;
     uint32_t pts;
@@ -617,9 +619,18 @@ static void app_audio_i2s_task(void *arg)
     memset(stereo_frame_buffer, 0, sizeof(stereo_frame_buffer));
 #endif
 
-    app_audio_i2s_log_warmup_stats(raw_frame_buffer, sizeof(raw_frame_buffer));
+    while (!s_audio_i2s.stop_requested) {
+        while (!s_audio_i2s.running && !s_audio_i2s.stop_requested) {
+            s_audio_i2s.task_idle = true;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (s_audio_i2s.stop_requested) {
+            break;
+        }
+        s_audio_i2s.task_idle = false;
+        app_audio_i2s_log_warmup_stats(raw_frame_buffer, sizeof(raw_frame_buffer));
 
-    while (s_audio_i2s.running) {
+        while (s_audio_i2s.running && !s_audio_i2s.stop_requested) {
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_audio_i2s.rx_handle, raw_frame_buffer, sizeof(raw_frame_buffer),
                                          &bytes_read, pdMS_TO_TICKS(APP_AUDIO_I2S_READ_TIMEOUT_MS));
@@ -804,7 +815,7 @@ static void app_audio_i2s_task(void *arg)
             uint32_t avg_abs = sample_count ? (uint32_t)(abs_sum / (int64_t)sample_count) : 0U;
             bool near_zero = raw_avg_abs <= 8U && raw_peak <= 32;
             bool constant_or_near_zero = all_same || near_zero;
-            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d knee=%d limit=%d limited=%u)",
+            ESP_LOGI(TAG, "Mic frames processed=%u sent=%u (%u bytes last read, raw_avg_abs=%u raw_peak=%u avg_abs=%u peak=%u zero_crossings=%u first_sample=%d gain=%d/%d knee=%d limit=%d limited=%u stack_hwm=%u)",
                      (unsigned)s_audio_i2s.processed_frame_count,
                      (unsigned)s_audio_i2s.sent_frame_count,
                      (unsigned)bytes_read,
@@ -812,7 +823,8 @@ static void app_audio_i2s_task(void *arg)
                      (unsigned)avg_abs, (unsigned)peak, (unsigned)zero_crossings, (int)first_sample,
                      APP_AUDIO_I2S_GAIN_NUM, APP_AUDIO_I2S_GAIN_DEN,
                      APP_AUDIO_I2S_SOFT_KNEE, APP_AUDIO_I2S_OUTPUT_LIMIT,
-                     (unsigned)limited_count);
+                     (unsigned)limited_count,
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
 #if APP_AUDIO_I2S_PROFILE_ENABLE
             {
                 uint32_t avg_frame_time_us = s_audio_i2s.profile_window_frames
@@ -898,9 +910,13 @@ static void app_audio_i2s_task(void *arg)
                          s_audio_i2s_modes[s_audio_i2s.mode_index].name);
             }
         }
+        }
+        waiting_logged = false;
+        s_audio_i2s.task_idle = true;
     }
 
     s_audio_i2s.task = NULL;
+    s_audio_i2s.task_idle = true;
     vTaskDelete(NULL);
 }
 
@@ -952,13 +968,20 @@ esp_err_t app_audio_i2s_start(void)
     s_audio_i2s.sent_frame_count = 0;
     s_audio_i2s.pts = 0;
 
-    ESP_LOGI(TAG, "Free heap before mic task create: %u", (unsigned)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Free heap before mic task start: free=%u largest=%u task=%d",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             s_audio_i2s.task != NULL ? 1 : 0);
 
-    if (xTaskCreate(app_audio_i2s_task, "app_audio_i2s", APP_AUDIO_I2S_STACK_SIZE, NULL, 4,
-                    &s_audio_i2s.task) != pdPASS) {
-        s_audio_i2s.running = false;
-        app_audio_i2s_deinit_channel();
-        return ESP_ERR_NO_MEM;
+    if (s_audio_i2s.task == NULL) {
+        s_audio_i2s.stop_requested = false;
+        s_audio_i2s.task_idle = false;
+        if (xTaskCreate(app_audio_i2s_task, "app_audio_i2s", APP_AUDIO_I2S_STACK_SIZE, NULL, 4,
+                        &s_audio_i2s.task) != pdPASS) {
+            s_audio_i2s.running = false;
+            app_audio_i2s_deinit_channel();
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     ESP_LOGI(TAG, "Cardputer mic audio publisher started");
@@ -992,15 +1015,17 @@ esp_err_t app_audio_i2s_pause_for_playback(void)
     }
     s_audio_i2s.running = false;
     task = s_audio_i2s.task;
-    for (uint32_t i = 0; task != NULL && s_audio_i2s.task != NULL && i < 50U; i++) {
+    for (uint32_t i = 0; task != NULL && !s_audio_i2s.task_idle && i < 50U; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (s_audio_i2s.task != NULL) {
-        ESP_LOGW(TAG, "Mic task did not exit before playback pause timeout; deinitializing RX anyway");
+    if (!s_audio_i2s.task_idle) {
+        ESP_LOGW(TAG, "Mic task did not idle before playback pause timeout; deinitializing RX anyway");
     }
     app_audio_i2s_deinit_rx_channel_keep_adv_adc();
-    ESP_LOGI(TAG, "Paused ADV mic RX for playback while keeping ES8311 ADC powered in mode %s",
-             s_audio_i2s_modes[s_audio_i2s.known_good_mode_index].name);
+    ESP_LOGI(TAG, "Paused ADV mic RX for playback while keeping task and ES8311 ADC powered in mode %s free=%u largest=%u",
+             s_audio_i2s_modes[s_audio_i2s.known_good_mode_index].name,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     return ESP_OK;
 }
 
@@ -1008,7 +1033,7 @@ esp_err_t app_audio_i2s_stop(void)
 {
     TaskHandle_t task;
 
-    if (!s_audio_i2s.running) {
+    if (!s_audio_i2s.running && s_audio_i2s.task == NULL) {
 #if APP_AUDIO_I2S_USE_CARDPUTER_ADV
         if (s_audio_i2s.adv_adc_kept_on_for_playback) {
             s_audio_i2s.adv_adc_kept_on_for_playback = false;
@@ -1019,6 +1044,7 @@ esp_err_t app_audio_i2s_stop(void)
         return ESP_OK;
     }
     s_audio_i2s.running = false;
+    s_audio_i2s.stop_requested = true;
     task = s_audio_i2s.task;
     for (uint32_t i = 0; task != NULL && s_audio_i2s.task != NULL && i < 50U; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
