@@ -276,7 +276,7 @@ static esp_err_t app_wait_for_start_key(void)
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << APP_CARDPUTER_ADV_KB_INT_GPIO,
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
@@ -285,17 +285,15 @@ static esp_err_t app_wait_for_start_key(void)
     ESP_LOGI(TAG, "Press '%c' on the keyboard to start the agent", APP_AGORA_START_KEY);
 
     while (true) {
-        if (gpio_get_level(APP_CARDPUTER_ADV_KB_INT_GPIO) == 0) {
-            app_keyboard_event_t event = { 0 };
-            if (app_keyboard_get_event(&kb, &event) == ESP_OK && event.pressed) {
-                char key = app_keyboard_event_to_char(&event);
-                if (key != 0) {
-                    ESP_LOGI(TAG, "Keyboard key pressed: '%c'", key);
-                }
-                if (key == APP_AGORA_START_KEY || key == (char)toupper((unsigned char)APP_AGORA_START_KEY)) {
-                    app_keyboard_deinit(&kb);
-                    return ESP_OK;
-                }
+        app_keyboard_event_t event = { 0 };
+        if (app_keyboard_get_event(&kb, &event) == ESP_OK && event.pressed) {
+            char key = app_keyboard_event_to_char(&event);
+            if (key != 0) {
+                ESP_LOGI(TAG, "Keyboard key pressed: '%c'", key);
+            }
+            if (key == APP_AGORA_START_KEY || key == (char)toupper((unsigned char)APP_AGORA_START_KEY)) {
+                app_keyboard_deinit(&kb);
+                return ESP_OK;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -315,24 +313,22 @@ static esp_err_t app_wait_for_toggle_key_press(void)
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << APP_CARDPUTER_ADV_KB_INT_GPIO,
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
 
     while (true) {
-        if (gpio_get_level(APP_CARDPUTER_ADV_KB_INT_GPIO) == 0) {
-            app_keyboard_event_t event = { 0 };
-            if (app_keyboard_get_event(&kb, &event) == ESP_OK && event.pressed) {
-                char key = app_keyboard_event_to_char(&event);
-                if (key != 0) {
-                    ESP_LOGI(TAG, "Keyboard key pressed: '%c'", key);
-                }
-                if (key == APP_AGORA_START_KEY || key == (char)toupper((unsigned char)APP_AGORA_START_KEY)) {
-                    app_keyboard_deinit(&kb);
-                    return ESP_OK;
-                }
+        app_keyboard_event_t event = { 0 };
+        if (app_keyboard_get_event(&kb, &event) == ESP_OK && event.pressed) {
+            char key = app_keyboard_event_to_char(&event);
+            if (key != 0) {
+                ESP_LOGI(TAG, "Keyboard key pressed: '%c'", key);
+            }
+            if (key == APP_AGORA_START_KEY || key == (char)toupper((unsigned char)APP_AGORA_START_KEY)) {
+                app_keyboard_deinit(&kb);
+                return ESP_OK;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
