@@ -710,10 +710,10 @@ esp_err_t app_protocol_start_agent(const app_protocol_config_t *config)
     }
 
     ESP_RETURN_ON_ERROR(app_protocol_dup_format(&body,
-                                                "{\"channelName\":\"%s\",\"rtcUid\":%lu,\"userUid\":%lu,\"parameters\":{\"output_audio_codec\":\"%s\"}}",
+                                                "{\"channelName\":\"%s\",\"rtcUid\":\"%s\",\"userUid\":\"%s\",\"parameters\":{\"output_audio_codec\":\"%s\"}}",
                                                 config->channel_name,
-                                                strtoul(config->agent_uid, NULL, 10),
-                                                strtoul(config->uid, NULL, 10),
+                                                config->agent_uid,
+                                                config->uid,
                                                 APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC),
                         TAG, "Failed to build Start Agent request");
 
