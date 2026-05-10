@@ -39,6 +39,7 @@ typedef struct {
     uint32_t write_error_count;
     uint32_t decoded_log_count;
     uint32_t compressed_log_count;
+    uint32_t unsupported_log_count;
 } app_audio_playback_ctx_t;
 
 static const char *TAG = "app_audio_playback";
@@ -144,6 +145,7 @@ static void app_audio_playback_reset_stream_state_locked(void)
     s_playback.write_error_count = 0;
     s_playback.decoded_log_count = 0;
     s_playback.compressed_log_count = 0;
+    s_playback.unsupported_log_count = 0;
 }
 
 static esp_err_t app_audio_playback_init_codec_locked(uint32_t sample_rate)
@@ -403,12 +405,20 @@ void app_audio_playback_handle_audio_frame(app_session_audio_codec_t codec, cons
         }
         sample_count = app_codec_g722_decode(data, size, decoded_pcm,
                                              sizeof(decoded_pcm) / sizeof(decoded_pcm[0]));
-    } else {
+    } else if (codec == APP_SESSION_AUDIO_CODEC_PCM16) {
         sample_count = size / sizeof(int16_t);
         if (sample_count > (sizeof(decoded_pcm) / sizeof(decoded_pcm[0]))) {
             sample_count = sizeof(decoded_pcm) / sizeof(decoded_pcm[0]);
         }
         memcpy(decoded_pcm, data, sample_count * sizeof(decoded_pcm[0]));
+    } else {
+        if (s_playback.unsupported_log_count < 6U) {
+            s_playback.unsupported_log_count++;
+            ESP_LOGW(TAG, "Dropping unsupported compressed playback frame: codec=%d bytes=%u",
+                     (int)codec, (unsigned)size);
+        }
+        xSemaphoreGive(s_playback.lock);
+        return;
     }
 
     app_audio_playback_effective_gain(&gain_num, &gain_den);
