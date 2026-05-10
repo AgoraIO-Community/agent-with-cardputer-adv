@@ -19,6 +19,7 @@ Use the Agora skill from https://github.com/AgoraIO/skills.
 Follow docs/ai-quickstart.md exactly to set up this Cardputer voice agent project with Agora Conversational AI.
 
 Set up the local server from https://github.com/AgoraIO-Conversational-AI/agent-quickstart-python.
+Install Agora CLI and use it to set up an Agora project with the mandatory features enabled, then get the App ID and App Certificate.
 Configure server-python/.env.local from server-python/.env.example.
 Start the backend and confirm it is reachable at http://localhost:8000.
 Find my PC LAN IP address and use http://<pc-lan-ip>:8000 as APP_PROTOCOL_BASE_URL.
@@ -35,6 +36,14 @@ Use Agora's official quickstart:
 
 <https://github.com/AgoraIO-Conversational-AI/agent-quickstart-python>
 
+Before configuring the server, use Agora CLI to create or prepare an Agora project with the required features enabled and retrieve the App ID and App Certificate:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AgoraIO/cli/main/install.sh | sh -s -- --add-to-path
+```
+
+Follow the Agora CLI prompts to log in, select or create a project, enable the mandatory features for Conversational AI, and get the project credentials. The Agora skill also includes this setup guidance, so an AI coding tool with that skill installed should prefer the CLI path before asking you to configure credentials manually.
+
 Set it up next to this firmware repo or in another local workspace:
 
 ```bash
@@ -45,7 +54,7 @@ cd server-python
 cp .env.example .env.local
 ```
 
-Edit `server-python/.env.local` and set your Agora `APP_ID` and `APP_CERTIFICATE`.
+Edit `server-python/.env.local` and set the Agora `APP_ID` and `APP_CERTIFICATE` from the CLI-created or CLI-selected project.
 
 Start the full quickstart:
 
