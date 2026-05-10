@@ -6,8 +6,10 @@ Use this guide with Codex, Claude Code, Cursor, Windsurf, Copilot, or another AI
 
 Set up both parts of the local development flow:
 
-1. A local Agora Conversational AI quickstart server running on your PC.
+1. Agora's `agent-quickstart-python` server running on your PC.
 2. This Cardputer firmware, configured to reach that server at `http://<pc-lan-ip>:8000`.
+
+Server repo: <https://github.com/AgoraIO-Conversational-AI/agent-quickstart-python>
 
 Keep the Cardputer and your PC on the same Wi-Fi network.
 
