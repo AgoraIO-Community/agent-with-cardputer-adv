@@ -8,13 +8,19 @@
   - [🛠️ Option 2: Manual Setup](#️-option-2-manual-setup)
 - [💻 Develop With PlatformIO](#-develop-with-platformio)
 
+---
+
 # 🤖 Cardputer Voice Agent With Agora Conversational AI
 
 Run an Agora Conversational AI voice agent on M5Stack Cardputer ADV. The firmware connects over Wi-Fi to a local quickstart server, joins Agora RTSA, and lets you talk with the agent from the Cardputer.
 
+---
+
 ## 🚀 Quickstart
 
 This firmware talks to a local Agora Conversational AI server running on your PC. Keep the Cardputer and your PC on the same Wi-Fi, then configure the firmware with your PC's LAN address on port `8000`, for example `http://192.168.0.101:8000`.
+
+---
 
 ### ✨ Option 1: Use Your AI Coding Tool
 
@@ -44,9 +50,13 @@ pio device monitor
 
 Press `k` on the Cardputer keyboard to start the agent.
 
+---
+
 ### 🛠️ Option 2: Manual Setup
 
 If you prefer direct terminal steps, follow [docs/manual-setup.md](docs/manual-setup.md).
+
+---
 
 ## 💻 Develop With PlatformIO
 
