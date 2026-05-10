@@ -66,6 +66,28 @@ For local development:
 
 `src/app_config_local.h` is git-ignored and overrides the placeholder defaults in `src/app_config.h`.
 
+For a new Cardputer ADV setup, start from the checked-in template:
+
+```bash
+cp src/app_config.local.example.h src/app_config_local.h
+```
+
+Then edit:
+
+- `APP_WIFI_SSID` / `APP_WIFI_PASSWORD`
+- `APP_PROTOCOL_BASE_URL`, for example `http://192.168.0.101:8000`
+
+The template enables the hardware-verified path:
+
+- G.711A / PCMA app-side encode/decode
+- keyboard-triggered `startAgent` / `stopAgent`
+- pull playback through the Cardputer ADV speaker
+- half-duplex mic/speaker switching on shared I2S pins
+- Cardputer ADV mic capture on BCK `41`, WS `43`, DATA `46`
+- ES8311 I2C control on SDA `8`, SCL `9`
+
+Mic gain defaults to `APP_AUDIO_I2S_GAIN_NUM 6` in the template. If remote listeners still hear you quietly, try `8`; if your voice clips, try `4` or `5`. Speaker gain defaults to `APP_AUDIO_PLAYBACK_GAIN_NUM 24`, while firmware caps the effective gain and applies soft limiting to keep playback from sounding harsh.
+
 ## What The Firmware Does Today
 
 1. Connects to Wi-Fi and logs IP info
@@ -89,13 +111,13 @@ On a working run, the monitor should show lines like:
 - `RTSA session started: ...`
 - `Joined RTC channel successfully: ...`
 - `Agent start request accepted`
-- `Fake audio frames sent: 250`
+- `Audio mode -> RECORDING reason=start`
 
 For remote speaker playback, you should also see lines like:
 
 - `Cardputer ADV speaker playback ready; waiting for remote audio`
 - `Remote audio stream callback fired: codec=1 sample_rate=8000 channels=1`
-- `Opened Cardputer playback codec on bck=41 ws=43 dout=42 ...`
+- `Opened direct Cardputer playback I2S/DAC path on bck=41 ws=43 dout=42 ...`
 - `First remote audio frame written to speaker: ...`
 - `Audio mode -> PLAYBACK`
 - `Silence uplink frames sent during playback: ...`
@@ -105,7 +127,7 @@ For the real mic path, you should instead see lines like:
 
 - `Initialized Cardputer ADV mic I2S RX on bck=41 ws=43 data=46 ... slot=... ws_inv=... bclk_inv=...`
 - `Cardputer mic audio publisher started`
-- `Mic audio frames sent: 250 ...`
+- `Mic frames processed=250 sent=250 ... raw_avg_abs=... avg_abs=... gain=6/1 knee=9000 limit=22000 ...`
 - `Mic profile: frames=250 avg_us=... max_us=... deadline_miss=0 send_fail=0 ...`
 
 If the initial ADV framing is wrong, you may also see lines like:
@@ -119,18 +141,30 @@ If the initial ADV framing is wrong, you may also see lines like:
 - Local Wi-Fi and protocol values must be supplied through `src/app_config_local.h`.
 - The stable live-mic path currently uses `APP_AUDIO_CODEC_G711A`.
 - The board now runs in logical half-duplex for shared mic/speaker hardware. During playback, the firmware sends silence uplink frames instead of keeping the mic hardware active.
-- Half-duplex gating is enabled by default. Pull playback is still off in the tracked example config until explicitly enabled locally.
+- Half-duplex gating and pull playback are enabled in the tracked local example config for Cardputer ADV.
 
-## Next Step
+## New User Checklist
 
-Use the known-good Cardputer ADV mic baseline:
+Use the known-good Cardputer ADV baseline:
 
-1. Set these in `src/app_config_local.h`:
+1. Copy the example config:
+   ```bash
+   cp src/app_config.local.example.h src/app_config_local.h
+   ```
+2. Set these required values in `src/app_config_local.h`:
+   - `APP_WIFI_SSID`
+   - `APP_WIFI_PASSWORD`
+   - `APP_PROTOCOL_BASE_URL`
+3. Keep these Cardputer ADV audio settings unless you are intentionally experimenting:
    - `APP_AUDIO_USE_I2S_MIC 1`
    - `APP_AUDIO_CODEC APP_AUDIO_CODEC_G711A`
+   - `APP_AGORA_PROTOCOL_OUTPUT_AUDIO_CODEC "pcma"`
+   - `APP_AGORA_START_ON_KEYPRESS 1`
+   - `APP_AUDIO_ENABLE_PULL_PLAYBACK 1`
    - `APP_AUDIO_ENABLE_HALF_DUPLEX_GATING 1`
    - `APP_AUDIO_I2S_USE_CARDPUTER_ADV 1`
    - `APP_AUDIO_I2S_PORT I2S_NUM_1`
+   - `APP_AUDIO_I2S_MIC_PORT I2S_NUM_0`
    - `APP_AUDIO_I2S_MIC_BCK_GPIO GPIO_NUM_41`
    - `APP_AUDIO_I2S_MIC_CLK_GPIO GPIO_NUM_43`
    - `APP_AUDIO_I2S_MIC_DATA_GPIO GPIO_NUM_46`
@@ -138,13 +172,16 @@ Use the known-good Cardputer ADV mic baseline:
    - `APP_AUDIO_I2S_ADV_I2C_SDA_GPIO GPIO_NUM_8`
    - `APP_AUDIO_I2S_ADV_I2C_SCL_GPIO GPIO_NUM_9`
    - `APP_AUDIO_I2S_CAPTURE_RATE 16000`
-2. Upload and monitor
-3. Confirm logs for:
+   - `APP_AUDIO_I2S_GAIN_NUM 6`
+   - `APP_AUDIO_PLAYBACK_GAIN_NUM 24`
+4. Build, upload, and monitor
+5. Press `k` on the Cardputer keyboard to start the agent
+6. Confirm logs for:
    - `Cardputer mic audio publisher started`
    - `Initialized Cardputer ADV mic I2S RX ...`
-   - `Mic audio frames sent: ... avg_abs=... peak=...`
+   - `Mic frames processed=... raw_avg_abs=... avg_abs=... gain=6/1 ...`
    - `Protocol config acquired: ...`
    - `Joined RTC channel successfully: ...`
    - `Remote audio stream callback fired: ...`
    - `First remote audio frame written to speaker: ...`
-4. If the mic frames flow but remote audio quality still needs work, continue tuning the stable G.711A path first.
+7. If remote listeners hear you too quietly, raise `APP_AUDIO_I2S_GAIN_NUM` to `8`. If they hear clipping, lower it to `4` or `5`.
